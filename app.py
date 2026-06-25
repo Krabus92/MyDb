@@ -136,22 +136,40 @@ class MyDbApp(tk.Tk):
         self.groups_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_group_select())
         self.groups_tree.bind("<Button-3>", self._on_group_right_click)
 
-        # Right: products in the selected group (or all of them).
+        # Right: a search box over the products in the selected group.
         frame = ttk.Frame(body)
         frame.pack(side="left", fill="both", expand=True)
+
+        search_bar = ttk.Frame(frame)
+        search_bar.pack(fill="x", pady=(0, 5))
+        ttk.Label(search_bar, text="Search").pack(side="left")
+        self.search = ttk.Entry(search_bar)
+        self.search.pack(side="left", fill="x", expand=True, padx=5)
+        enable_latvian_input(self.search)
+        self.search.bind("<KeyRelease>", lambda _e: self.refresh_positions())
+        ttk.Button(
+            search_bar, text="Clear", command=self._clear_search
+        ).pack(side="left")
+
+        tree_area = ttk.Frame(frame)
+        tree_area.pack(fill="both", expand=True)
         # The main window is a catalog of products, not a stock count, so it
         # shows no quantity — that lives inside each position's card.
         columns = ("code", "name", "unit")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings")
+        self.tree = ttk.Treeview(tree_area, columns=columns, show="headings")
         for col in columns:
             self.tree.heading(col, text=col.capitalize())
             self.tree.column(col, width=120, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        scroll = ttk.Scrollbar(tree_area, orient="vertical", command=self.tree.yview)
         scroll.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind("<Double-1>", lambda _e: self.on_open())
         self.tree.bind("<Button-3>", self._on_tree_right_click)
+
+    def _clear_search(self) -> None:
+        self.search.delete(0, tk.END)
+        self.refresh_positions()
 
     # ----- actions ------------------------------------------------------
 
@@ -274,7 +292,10 @@ class MyDbApp(tk.Tk):
 
     def refresh_positions(self) -> None:
         self.tree.delete(*self.tree.get_children())
+        term = self.search.get().strip().lower()
         for row in db.list_products(self.conn, self.current_group_id):
+            if term and term not in row["code"].lower() and term not in row["name"].lower():
+                continue
             self.tree.insert(
                 "", tk.END, iid=str(row["id"]),
                 values=(row["code"], row["name"], row["unit"]),
@@ -308,6 +329,16 @@ class PositionCard(tk.Toplevel):
         self.geometry("520x620")
         self.transient(app)
 
+        # Everything lives in a left "content" column; a computed-nutrition
+        # panel is shown to its right when the checkbox is ticked.
+        self.content = ttk.Frame(self)
+        self.content.pack(side="left", fill="both", expand=True)
+        self.show_nutrition_var = tk.BooleanVar(value=False)
+        self.nutrition_panel = ttk.LabelFrame(
+            self, text="Uzturvielas / 100 g (no sastāva)"
+        )
+        self._build_nutrition_panel()
+
         self._build_details()
         self._build_description()
         self._build_actions()
@@ -321,7 +352,7 @@ class PositionCard(tk.Toplevel):
     # ----- details (top) ------------------------------------------------
 
     def _build_details(self) -> None:
-        frame = ttk.LabelFrame(self, text="Details")
+        frame = ttk.LabelFrame(self.content, text="Details")
         frame.pack(fill="x", padx=10, pady=(10, 5))
 
         self.code = self._field(frame, "Code", 0)
@@ -356,6 +387,59 @@ class PositionCard(tk.Toplevel):
         ttk.Button(
             buttons, text="uzturvielas", command=self.on_nutrition
         ).pack(side="left", padx=5)
+        ttk.Checkbutton(
+            buttons, text="rādīt aprēķināto", variable=self.show_nutrition_var,
+            command=self._toggle_nutrition_panel,
+        ).pack(side="left")
+
+    # ----- computed nutrition panel (right) -----------------------------
+
+    def _build_nutrition_panel(self) -> None:
+        self.nutrition_vars: dict[str, tk.StringVar] = {}
+        rows = [
+            ("fat", "Tauki"),
+            ("saturated_fat", "Piesātinātās taukskābes"),
+            ("carbs", "Ogļhidrāti"),
+            ("sugar", "Cukurs"),
+            ("protein", "Olbaltumvielas"),
+            ("salt", "Sāls"),
+            ("kcal", "kcal"),
+            ("kj", "KJ"),
+        ]
+        for i, (key, label) in enumerate(rows):
+            ttk.Label(self.nutrition_panel, text=label).grid(
+                row=i, column=0, sticky="w", padx=8, pady=2
+            )
+            var = tk.StringVar(value="—")
+            ttk.Label(
+                self.nutrition_panel, textvariable=var, width=10, anchor="e"
+            ).grid(row=i, column=1, sticky="e", padx=8, pady=2)
+            self.nutrition_vars[key] = var
+
+    def _toggle_nutrition_panel(self) -> None:
+        if self.show_nutrition_var.get():
+            self._refresh_nutrition_panel()
+            self.nutrition_panel.pack(side="right", fill="y", padx=(0, 10), pady=10)
+            self.geometry("820x620")
+        else:
+            self.nutrition_panel.pack_forget()
+            self.geometry("520x620")
+
+    def _refresh_nutrition_panel(self) -> None:
+        """Recompute the per-100 g roll-up from nested positions and show it."""
+        if self.product_id is None:
+            for var in self.nutrition_vars.values():
+                var.set("—")
+            return
+        n = db.effective_nutrition(self.conn, self.product_id)
+        for key in db.NUTRIENTS:
+            self.nutrition_vars[key].set(db.format_quantity(n[key]))
+        self.nutrition_vars["kcal"].set(
+            db.format_quantity(db.energy_kcal(n["fat"], n["carbs"], n["protein"]))
+        )
+        self.nutrition_vars["kj"].set(
+            db.format_quantity(db.energy_kj(n["fat"], n["carbs"], n["protein"]))
+        )
 
     def _reload_groups(self) -> None:
         """Fill the group dropdown with '(no group)' plus every existing group."""
@@ -389,7 +473,7 @@ class PositionCard(tk.Toplevel):
     # ----- description (middle) -----------------------------------------
 
     def _build_description(self) -> None:
-        frame = ttk.LabelFrame(self, text="Description")
+        frame = ttk.LabelFrame(self.content, text="Description")
         frame.pack(fill="both", expand=False, padx=10, pady=5)
         self.description = tk.Text(frame, height=5, wrap="word")
         self.description.pack(fill="both", expand=True, padx=5, pady=5)
@@ -398,7 +482,7 @@ class PositionCard(tk.Toplevel):
     # ----- actions (bottom-right) ---------------------------------------
 
     def _build_actions(self) -> None:
-        bar = ttk.Frame(self)
+        bar = ttk.Frame(self.content)
         bar.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
         # Packed right-to-left: Cancel sits on the far right, Ok just left of it.
         ttk.Button(bar, text="Cancel", command=self.on_cancel).pack(side="right")
@@ -491,7 +575,7 @@ class PositionCard(tk.Toplevel):
     # ----- nested codes (bottom) ----------------------------------------
 
     def _build_components(self) -> None:
-        self.comp_frame = ttk.LabelFrame(self, text="Nested codes")
+        self.comp_frame = ttk.LabelFrame(self.content, text="Nested codes")
         self.comp_frame.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
         columns = ("child_code", "child_name", "quantity", "unit")
@@ -566,18 +650,20 @@ class PositionCard(tk.Toplevel):
 
     def refresh_components(self) -> None:
         self.comp_tree.delete(*self.comp_tree.get_children())
-        if self.product_id is None:
-            return
-        for row in db.list_components(self.conn, self.product_id):
-            self.comp_tree.insert(
-                "", tk.END, iid=str(row["id"]),
-                values=(
-                    row["child_code"],
-                    row["child_name"] or "(unknown)",
-                    db.format_quantity(row["quantity"]),
-                    row["unit"],
-                ),
-            )
+        if self.product_id is not None:
+            for row in db.list_components(self.conn, self.product_id):
+                self.comp_tree.insert(
+                    "", tk.END, iid=str(row["id"]),
+                    values=(
+                        row["child_code"],
+                        row["child_name"] or "(unknown)",
+                        db.format_quantity(row["quantity"]),
+                        row["unit"],
+                    ),
+                )
+        # The roll-up depends on the nested codes, so keep the panel in sync.
+        if self.show_nutrition_var.get():
+            self._refresh_nutrition_panel()
 
     def _set_components_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"

@@ -134,6 +134,75 @@ class DbLayerTests(unittest.TestCase):
         self.assertEqual(db.energy_kcal(10, 20, 5), 190)
         self.assertAlmostEqual(db.energy_kj(10, 20, 5), 190 * 4.184)
 
+    # ----- computed nutrition (roll-up from nested positions) -----------
+
+    def test_effective_nutrition_raw_uses_stored(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Flour", 1, "kg")
+        db.update_nutrition(self.conn, pid, 1, 0.2, 70, 1, 10, 0.01)
+        n = db.effective_nutrition(self.conn, pid)
+        self.assertEqual(n["fat"], 1)
+        self.assertEqual(n["carbs"], 70)
+        self.assertEqual(n["protein"], 10)
+
+    def test_effective_nutrition_single_ingredient_equals_it(self) -> None:
+        # A recipe that is 100% one ingredient has that ingredient's per-100 g.
+        a = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
+        b = db.add_product(self.conn, "B-200", "Butter", 1, "kg")  # 1 kg/unit
+        db.update_nutrition(self.conn, b, 80, 50, 1, 0, 1, 1.5)
+        db.add_component(self.conn, a, "B-200", 2)  # 2 kg of butter
+
+        n = db.effective_nutrition(self.conn, a)
+        self.assertAlmostEqual(n["fat"], 80)
+        self.assertAlmostEqual(n["saturated_fat"], 50)
+        self.assertAlmostEqual(n["protein"], 1)
+        self.assertAlmostEqual(n["salt"], 1.5)
+
+    def test_effective_nutrition_weighted_by_mass(self) -> None:
+        a = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
+        b = db.add_product(self.conn, "B-200", "Fatty", 1, "kg")
+        c = db.add_product(self.conn, "C-300", "Lean", 1, "kg")
+        db.update_nutrition(self.conn, b, 10, 0, 0, 0, 0, 0)   # fat 10/100g
+        db.update_nutrition(self.conn, c, 0, 0, 0, 0, 30, 0)   # protein 30/100g
+        db.add_component(self.conn, a, "B-200", 1)  # 1 kg = 1000 g
+        db.add_component(self.conn, a, "C-300", 1)  # 1 kg = 1000 g
+
+        n = db.effective_nutrition(self.conn, a)
+        # 1000 g each: fat mass 100 over 2000 g -> 5/100g; protein 300 -> 15/100g.
+        self.assertAlmostEqual(n["fat"], 5)
+        self.assertAlmostEqual(n["protein"], 15)
+
+    def test_effective_nutrition_uses_piece_weight_for_gab(self) -> None:
+        a = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
+        # An egg: counted in pieces, 0.05 kg each, 11 g fat per 100 g.
+        egg = db.add_product(self.conn, "E-1", "Egg", 1, "gab.", "", 0.05)
+        db.update_nutrition(self.conn, egg, 11, 3, 1, 1, 13, 0.3)
+        db.add_component(self.conn, a, "E-1", 4)  # 4 eggs = 200 g, all of it
+
+        n = db.effective_nutrition(self.conn, a)
+        self.assertAlmostEqual(n["fat"], 11)
+        self.assertAlmostEqual(n["protein"], 13)
+
+    def test_effective_nutrition_recurses_through_subrecipes(self) -> None:
+        base = db.add_product(self.conn, "C-300", "Oil", 1, "kg")
+        db.update_nutrition(self.conn, base, 100, 14, 0, 0, 0, 0)  # pure fat
+        mid = db.add_product(self.conn, "B-200", "Dressing", 1, "kg")
+        db.add_component(self.conn, mid, "C-300", 1)  # Dressing is 100% Oil
+        top = db.add_product(self.conn, "A-100", "Salad", 1, "kg")
+        db.add_component(self.conn, top, "B-200", 1)  # Salad is 100% Dressing
+
+        n = db.effective_nutrition(self.conn, top)
+        self.assertAlmostEqual(n["fat"], 100)  # rolled up two levels
+
+    def test_effective_nutrition_is_cycle_safe(self) -> None:
+        a = db.add_product(self.conn, "A-100", "A", 1, "kg")
+        b = db.add_product(self.conn, "B-200", "B", 1, "kg")
+        db.update_nutrition(self.conn, a, 7, 0, 0, 0, 0, 0)
+        db.add_component(self.conn, a, "B-200", 1)
+        db.add_component(self.conn, b, "A-100", 1)  # A -> B -> A cycle
+
+        n = db.effective_nutrition(self.conn, a)  # must terminate
+        self.assertIsInstance(n["fat"], float)
+
     def test_init_db_adds_missing_weight_and_nutrition_columns(self) -> None:
         # A database created before weight/nutrition columns existed.
         conn = db.get_connection(":memory:")
@@ -329,6 +398,19 @@ class DbLayerTests(unittest.TestCase):
 
         db.update_product(self.conn, bolt, "B-200", "Bolt", 0, "gab.")
         self.assertEqual(db.list_components(self.conn, parent)[0]["unit"], "gab.")
+
+    def test_renaming_code_repoints_nested_references(self) -> None:
+        # Renaming a position's code must not orphan recipes that nest it.
+        parent = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 1, "kg")
+        db.add_component(self.conn, parent, "B-200", 5)
+
+        db.update_product(self.conn, bolt, "B-999", "Bolt", 1, "kg")
+
+        comp = db.list_components(self.conn, parent)[0]
+        self.assertEqual(comp["child_code"], "B-999")     # reference followed
+        self.assertEqual(comp["child_name"], "Bolt")       # still resolves
+        self.assertEqual(comp["quantity"], 5)              # unchanged
 
     def test_nested_code_must_reference_existing_position(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")

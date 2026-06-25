@@ -165,6 +165,9 @@ def format_quantity(quantity: float) -> str:
 
 # ----- nutrition energy ------------------------------------------------
 
+#: The six per-100 g nutrition values stored on every position.
+NUTRIENTS = ("fat", "saturated_fat", "carbs", "sugar", "protein", "salt")
+
 #: Energy per gram of macronutrient, in kcal.
 KCAL_PER_GRAM_FAT = 9.0
 KCAL_PER_GRAM_CARBS = 4.0
@@ -278,6 +281,10 @@ def update_product(
 ) -> None:
     """Update a position's main fields (everything except its nutrition).
 
+    If the position's code changes, every nested code that referenced the old
+    code is repointed to the new one, so recipes that use this position keep
+    working instead of orphaning to ``(unknown)``.
+
     If the position's quantity changes, its nested codes are scaled by the same
     factor: a nested quantity is the amount needed for the position's *current*
     quantity, so doubling the position doubles each nested code. Scaling needs a
@@ -298,6 +305,11 @@ def update_product(
             group_id, product_id,
         ),
     )
+    if old is not None and old["code"] != code:
+        conn.execute(
+            "UPDATE components SET child_code = ? WHERE child_code = ?",
+            (code, old["code"]),
+        )
     if old is not None and old["quantity"] > 0 and quantity != old["quantity"]:
         factor = quantity / old["quantity"]
         conn.execute(
@@ -456,3 +468,56 @@ def delete_component(conn: sqlite3.Connection, component_id: int) -> None:
     """Delete a single nested code by its id."""
     conn.execute("DELETE FROM components WHERE id = ?", (component_id,))
     conn.commit()
+
+
+# ----- computed nutrition ----------------------------------------------
+
+
+def effective_nutrition(
+    conn: sqlite3.Connection,
+    product_id: int,
+    _visiting: frozenset[int] = frozenset(),
+) -> dict[str, float]:
+    """Nutrition per 100 g of a position, as a dict over :data:`NUTRIENTS`.
+
+    A position made of nested codes is a recipe: its nutrition is rolled up from
+    its ingredients by weight. A raw position (no nested codes) contributes its
+    own stored per-100 g values. The roll-up recurses, so an ingredient that is
+    itself a recipe uses its computed values; ``_visiting`` breaks any cycles.
+
+    For each nested code of ``quantity`` of a child position:
+
+    * its mass in grams is ``quantity * child.weight_kg * 1000`` (a ``kg`` child
+      is 1 kg/unit, a ``gab.`` child uses its per-piece weight);
+    * it contributes ``grams / 100 * child_nutrient`` of each nutrient.
+
+    Summing masses and nutrient totals and dividing back by the total grams (then
+    times 100) gives the recipe's nutrition per 100 g.
+    """
+    row = get_product(conn, product_id)
+    if row is None:
+        return {n: 0.0 for n in NUTRIENTS}
+
+    components = list_components(conn, product_id)
+    if not components or product_id in _visiting:
+        # Raw ingredient (or a cycle): use the stored per-100 g values.
+        return {n: float(row[n]) for n in NUTRIENTS}
+
+    visiting = _visiting | {product_id}
+    total_grams = 0.0
+    totals = {n: 0.0 for n in NUTRIENTS}
+    for comp in components:
+        child = find_product_by_code(conn, comp["child_code"])
+        if child is None:
+            continue
+        grams = float(comp["quantity"]) * float(child["weight_kg"]) * 1000.0
+        if grams <= 0:
+            continue
+        child_nutrition = effective_nutrition(conn, child["id"], visiting)
+        total_grams += grams
+        for n in NUTRIENTS:
+            totals[n] += grams / 100.0 * child_nutrition[n]
+
+    if total_grams <= 0:
+        return {n: 0.0 for n in NUTRIENTS}
+    return {n: totals[n] / total_grams * 100.0 for n in NUTRIENTS}
