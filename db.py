@@ -43,12 +43,30 @@ def init_db(conn: sqlite3.Connection) -> None:
     """
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS groups (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
+
         CREATE TABLE IF NOT EXISTS products (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            code     TEXT NOT NULL UNIQUE,
-            name     TEXT NOT NULL,
-            quantity REAL NOT NULL DEFAULT 0,
-            unit     TEXT NOT NULL CHECK (unit IN ('gab.', 'kg'))
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            code          TEXT NOT NULL UNIQUE,
+            name          TEXT NOT NULL,
+            quantity      REAL NOT NULL DEFAULT 0,
+            unit          TEXT NOT NULL CHECK (unit IN ('gab.', 'kg')),
+            description   TEXT NOT NULL DEFAULT '',
+            -- Weight of one unit in kg. A 'kg' position weighs 1 kg per unit;
+            -- a 'gab.' (piece) position carries the weight of one piece here.
+            weight_kg     REAL NOT NULL DEFAULT 1,
+            -- Nutrition per 100 g of product (grams). kcal/kJ are computed.
+            fat           REAL NOT NULL DEFAULT 0,
+            saturated_fat REAL NOT NULL DEFAULT 0,
+            carbs         REAL NOT NULL DEFAULT 0,
+            sugar         REAL NOT NULL DEFAULT 0,
+            protein       REAL NOT NULL DEFAULT 0,
+            salt          REAL NOT NULL DEFAULT 0,
+            -- Optional group; NULL means ungrouped (shown only under "All").
+            group_id      INTEGER REFERENCES groups (id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS components (
@@ -62,7 +80,27 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_drop_component_unit(conn)
+    _migrate_add_product_columns(conn)
     conn.commit()
+
+
+def _migrate_add_product_columns(conn: sqlite3.Connection) -> None:
+    """Add product columns introduced after the original schema, if missing."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(products)")}
+    additions = [
+        ("description", "TEXT NOT NULL DEFAULT ''"),
+        ("weight_kg", "REAL NOT NULL DEFAULT 1"),
+        ("fat", "REAL NOT NULL DEFAULT 0"),
+        ("saturated_fat", "REAL NOT NULL DEFAULT 0"),
+        ("carbs", "REAL NOT NULL DEFAULT 0"),
+        ("sugar", "REAL NOT NULL DEFAULT 0"),
+        ("protein", "REAL NOT NULL DEFAULT 0"),
+        ("salt", "REAL NOT NULL DEFAULT 0"),
+        ("group_id", "INTEGER REFERENCES groups (id) ON DELETE SET NULL"),
+    ]
+    for name, decl in additions:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE products ADD COLUMN {name} {decl}")
 
 
 def _migrate_drop_component_unit(conn: sqlite3.Connection) -> None:
@@ -96,7 +134,10 @@ def _migrate_drop_component_unit(conn: sqlite3.Connection) -> None:
 
 
 #: Quantities are stored with at most this many digits after the decimal point.
-QUANTITY_DECIMALS = 3
+QUANTITY_DECIMALS = 5
+
+#: Quantities are always shown with at least this many decimals (e.g. "1.00").
+QUANTITY_MIN_DECIMALS = 2
 
 
 def _check_unit(unit: str) -> None:
@@ -109,7 +150,52 @@ def _round_qty(quantity: float) -> float:
     return round(float(quantity), QUANTITY_DECIMALS)
 
 
+def format_quantity(quantity: float) -> str:
+    """Format a quantity for display.
+
+    Always shows at least :data:`QUANTITY_MIN_DECIMALS` decimals and at most
+    :data:`QUANTITY_DECIMALS`, dropping any trailing zeros in between. So
+    ``1`` -> ``"1.00"``, ``1.3`` -> ``"1.30"``, ``1.30000`` -> ``"1.30"`` and
+    ``1.23456`` -> ``"1.23456"``.
+    """
+    text = f"{_round_qty(quantity):.{QUANTITY_DECIMALS}f}".rstrip("0")
+    integer, _, frac = text.partition(".")
+    return f"{integer}.{frac.ljust(QUANTITY_MIN_DECIMALS, '0')}"
+
+
+# ----- nutrition energy ------------------------------------------------
+
+#: Energy per gram of macronutrient, in kcal.
+KCAL_PER_GRAM_FAT = 9.0
+KCAL_PER_GRAM_CARBS = 4.0
+KCAL_PER_GRAM_PROTEIN = 4.0
+
+#: 1 kcal in kilojoules.
+KJ_PER_KCAL = 4.184
+
+
+def energy_kcal(fat: float, carbs: float, protein: float) -> float:
+    """Energy in kcal from macros (per whatever basis the macros are given)."""
+    return (
+        fat * KCAL_PER_GRAM_FAT
+        + carbs * KCAL_PER_GRAM_CARBS
+        + protein * KCAL_PER_GRAM_PROTEIN
+    )
+
+
+def energy_kj(fat: float, carbs: float, protein: float) -> float:
+    """Energy in kilojoules from macros."""
+    return energy_kcal(fat, carbs, protein) * KJ_PER_KCAL
+
+
 # ----- positions (products) --------------------------------------------
+
+
+#: Every column read back for a position, in a single place.
+_PRODUCT_FIELDS = (
+    "id, code, name, quantity, unit, description, weight_kg, "
+    "fat, saturated_fat, carbs, sugar, protein, salt, group_id"
+)
 
 
 def add_product(
@@ -118,28 +204,55 @@ def add_product(
     name: str,
     quantity: float,
     unit: str,
+    description: str = "",
+    weight_kg: float = 1.0,
+    group_id: int | None = None,
 ) -> int:
-    """Insert a position and return its new row id."""
+    """Insert a position and return its new row id.
+
+    ``weight_kg`` is the weight of one unit: a ``kg`` position is 1 kg per unit,
+    a ``gab.`` (piece) position carries the weight of one piece. Nutrition starts
+    at zero and is set later via :func:`update_nutrition`. ``group_id`` is the
+    group the position belongs to, or ``None`` for ungrouped.
+    """
     _check_unit(unit)
     cur = conn.execute(
-        "INSERT INTO products (code, name, quantity, unit) VALUES (?, ?, ?, ?)",
-        (code, name, _round_qty(quantity), unit),
+        """
+        INSERT INTO products
+            (code, name, quantity, unit, description, weight_kg, group_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            code, name, _round_qty(quantity), unit, description,
+            _round_qty(weight_kg), group_id,
+        ),
     )
     conn.commit()
     return cur.lastrowid
 
 
-def list_products(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Return all positions, ordered by code."""
+def list_products(
+    conn: sqlite3.Connection, group_id: int | None = None
+) -> list[sqlite3.Row]:
+    """Return positions ordered by code; all of them, or only one group's.
+
+    ``group_id`` of ``None`` (the default) returns every position; a group id
+    returns only the positions in that group.
+    """
+    if group_id is None:
+        return conn.execute(
+            f"SELECT {_PRODUCT_FIELDS} FROM products ORDER BY code"
+        ).fetchall()
     return conn.execute(
-        "SELECT id, code, name, quantity, unit FROM products ORDER BY code"
+        f"SELECT {_PRODUCT_FIELDS} FROM products WHERE group_id = ? ORDER BY code",
+        (group_id,),
     ).fetchall()
 
 
 def get_product(conn: sqlite3.Connection, product_id: int) -> sqlite3.Row | None:
     """Return one position by id, or ``None`` if it does not exist."""
     return conn.execute(
-        "SELECT id, code, name, quantity, unit FROM products WHERE id = ?",
+        f"SELECT {_PRODUCT_FIELDS} FROM products WHERE id = ?",
         (product_id,),
     ).fetchone()
 
@@ -147,7 +260,7 @@ def get_product(conn: sqlite3.Connection, product_id: int) -> sqlite3.Row | None
 def find_product_by_code(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
     """Return one position by its code, or ``None`` if no position uses it."""
     return conn.execute(
-        "SELECT id, code, name, quantity, unit FROM products WHERE code = ?",
+        f"SELECT {_PRODUCT_FIELDS} FROM products WHERE code = ?",
         (code,),
     ).fetchone()
 
@@ -159,8 +272,11 @@ def update_product(
     name: str,
     quantity: float,
     unit: str,
+    description: str = "",
+    weight_kg: float = 1.0,
+    group_id: int | None = None,
 ) -> None:
-    """Update every field of an existing position.
+    """Update a position's main fields (everything except its nutrition).
 
     If the position's quantity changes, its nested codes are scaled by the same
     factor: a nested quantity is the amount needed for the position's *current*
@@ -173,10 +289,14 @@ def update_product(
     conn.execute(
         """
         UPDATE products
-        SET code = ?, name = ?, quantity = ?, unit = ?
+        SET code = ?, name = ?, quantity = ?, unit = ?, description = ?,
+            weight_kg = ?, group_id = ?
         WHERE id = ?
         """,
-        (code, name, quantity, unit, product_id),
+        (
+            code, name, quantity, unit, description, _round_qty(weight_kg),
+            group_id, product_id,
+        ),
     )
     if old is not None and old["quantity"] > 0 and quantity != old["quantity"]:
         factor = quantity / old["quantity"]
@@ -191,9 +311,73 @@ def update_product(
     conn.commit()
 
 
+def update_nutrition(
+    conn: sqlite3.Connection,
+    product_id: int,
+    fat: float,
+    saturated_fat: float,
+    carbs: float,
+    sugar: float,
+    protein: float,
+    salt: float,
+) -> None:
+    """Set a position's nutrition values (grams per 100 g of product)."""
+    conn.execute(
+        """
+        UPDATE products
+        SET fat = ?, saturated_fat = ?, carbs = ?, sugar = ?, protein = ?, salt = ?
+        WHERE id = ?
+        """,
+        (
+            _round_qty(fat),
+            _round_qty(saturated_fat),
+            _round_qty(carbs),
+            _round_qty(sugar),
+            _round_qty(protein),
+            _round_qty(salt),
+            product_id,
+        ),
+    )
+    conn.commit()
+
+
 def delete_product(conn: sqlite3.Connection, product_id: int) -> None:
     """Delete a position and (via cascade) all of its nested codes."""
     conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    conn.commit()
+
+
+def set_product_group(
+    conn: sqlite3.Connection, product_id: int, group_id: int | None
+) -> None:
+    """Move a position into a group (or out of any group when ``None``)."""
+    conn.execute(
+        "UPDATE products SET group_id = ? WHERE id = ?", (group_id, product_id)
+    )
+    conn.commit()
+
+
+# ----- groups ----------------------------------------------------------
+
+
+def add_group(conn: sqlite3.Connection, name: str) -> int:
+    """Create a product group and return its new row id."""
+    name = name.strip()
+    if not name:
+        raise ValueError("group name must not be empty")
+    cur = conn.execute("INSERT INTO groups (name) VALUES (?)", (name,))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_groups(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all groups, ordered by name."""
+    return conn.execute("SELECT id, name FROM groups ORDER BY name").fetchall()
+
+
+def delete_group(conn: sqlite3.Connection, group_id: int) -> None:
+    """Delete a group; its positions become ungrouped (group_id set to NULL)."""
+    conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
     conn.commit()
 
 
