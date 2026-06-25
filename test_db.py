@@ -399,6 +399,19 @@ class DbLayerTests(unittest.TestCase):
         db.update_product(self.conn, bolt, "B-200", "Bolt", 0, "gab.")
         self.assertEqual(db.list_components(self.conn, parent)[0]["unit"], "gab.")
 
+    def test_renaming_code_repoints_nested_references(self) -> None:
+        # Renaming a position's code must not orphan recipes that nest it.
+        parent = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 1, "kg")
+        db.add_component(self.conn, parent, "B-200", 5)
+
+        db.update_product(self.conn, bolt, "B-999", "Bolt", 1, "kg")
+
+        comp = db.list_components(self.conn, parent)[0]
+        self.assertEqual(comp["child_code"], "B-999")     # reference followed
+        self.assertEqual(comp["child_name"], "Bolt")       # still resolves
+        self.assertEqual(comp["quantity"], 5)              # unchanged
+
     def test_nested_code_must_reference_existing_position(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         with self.assertRaises(ValueError):

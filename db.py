@@ -281,6 +281,10 @@ def update_product(
 ) -> None:
     """Update a position's main fields (everything except its nutrition).
 
+    If the position's code changes, every nested code that referenced the old
+    code is repointed to the new one, so recipes that use this position keep
+    working instead of orphaning to ``(unknown)``.
+
     If the position's quantity changes, its nested codes are scaled by the same
     factor: a nested quantity is the amount needed for the position's *current*
     quantity, so doubling the position doubles each nested code. Scaling needs a
@@ -301,6 +305,11 @@ def update_product(
             group_id, product_id,
         ),
     )
+    if old is not None and old["code"] != code:
+        conn.execute(
+            "UPDATE components SET child_code = ? WHERE child_code = ?",
+            (code, old["code"]),
+        )
     if old is not None and old["quantity"] > 0 and quantity != old["quantity"]:
         factor = quantity / old["quantity"]
         conn.execute(

@@ -136,22 +136,40 @@ class MyDbApp(tk.Tk):
         self.groups_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_group_select())
         self.groups_tree.bind("<Button-3>", self._on_group_right_click)
 
-        # Right: products in the selected group (or all of them).
+        # Right: a search box over the products in the selected group.
         frame = ttk.Frame(body)
         frame.pack(side="left", fill="both", expand=True)
+
+        search_bar = ttk.Frame(frame)
+        search_bar.pack(fill="x", pady=(0, 5))
+        ttk.Label(search_bar, text="Search").pack(side="left")
+        self.search = ttk.Entry(search_bar)
+        self.search.pack(side="left", fill="x", expand=True, padx=5)
+        enable_latvian_input(self.search)
+        self.search.bind("<KeyRelease>", lambda _e: self.refresh_positions())
+        ttk.Button(
+            search_bar, text="Clear", command=self._clear_search
+        ).pack(side="left")
+
+        tree_area = ttk.Frame(frame)
+        tree_area.pack(fill="both", expand=True)
         # The main window is a catalog of products, not a stock count, so it
         # shows no quantity — that lives inside each position's card.
         columns = ("code", "name", "unit")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings")
+        self.tree = ttk.Treeview(tree_area, columns=columns, show="headings")
         for col in columns:
             self.tree.heading(col, text=col.capitalize())
             self.tree.column(col, width=120, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        scroll = ttk.Scrollbar(tree_area, orient="vertical", command=self.tree.yview)
         scroll.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind("<Double-1>", lambda _e: self.on_open())
         self.tree.bind("<Button-3>", self._on_tree_right_click)
+
+    def _clear_search(self) -> None:
+        self.search.delete(0, tk.END)
+        self.refresh_positions()
 
     # ----- actions ------------------------------------------------------
 
@@ -274,7 +292,10 @@ class MyDbApp(tk.Tk):
 
     def refresh_positions(self) -> None:
         self.tree.delete(*self.tree.get_children())
+        term = self.search.get().strip().lower()
         for row in db.list_products(self.conn, self.current_group_id):
+            if term and term not in row["code"].lower() and term not in row["name"].lower():
+                continue
             self.tree.insert(
                 "", tk.END, iid=str(row["id"]),
                 values=(row["code"], row["name"], row["unit"]),
