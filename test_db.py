@@ -60,6 +60,11 @@ class DbLayerTests(unittest.TestCase):
         self.assertEqual(row["quantity"], 9)
         self.assertEqual(row["unit"], "kg")
 
+    def test_update_product_rejects_invalid_unit(self) -> None:
+        product_id = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
+        with self.assertRaises(ValueError):
+            db.update_product(self.conn, product_id, "A-100", "Widget", 1, "litres")
+
     def test_delete_product_cascades_to_components(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         db.add_product(self.conn, "B-200", "Bolt", 1, "gab.")
@@ -89,6 +94,12 @@ class DbLayerTests(unittest.TestCase):
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         with self.assertRaises(ValueError):
             db.add_component(self.conn, parent, "DOES-NOT-EXIST", 1, "gab.")
+
+    def test_component_rejects_invalid_unit(self) -> None:
+        parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
+        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        with self.assertRaises(ValueError):
+            db.add_component(self.conn, parent, "B-200", 5, "litres")
 
     def test_position_cannot_nest_itself(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
