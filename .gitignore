@@ -1,5 +1,6 @@
 # SQLite database files (local data, not source)
 *.sqlite3
+*.sqlite3.bak-*
 *.db
 
 # Python

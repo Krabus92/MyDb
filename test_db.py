@@ -65,6 +65,171 @@ class DbLayerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             db.update_product(self.conn, product_id, "A-100", "Widget", 1, "litres")
 
+    def test_product_description_defaults_empty_and_persists(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
+        self.assertEqual(db.get_product(self.conn, pid)["description"], "")
+
+        notes = "Mīkla ar ļoti garu aprakstu.\nOtrā rinda."
+        db.update_product(self.conn, pid, "A-100", "Widget", 1, "gab.", notes)
+        self.assertEqual(db.get_product(self.conn, pid)["description"], notes)
+
+    def test_add_product_with_description(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Widget", 1, "gab.", "a note")
+        self.assertEqual(db.get_product(self.conn, pid)["description"], "a note")
+
+    def test_init_db_adds_missing_description_column(self) -> None:
+        # Simulate a database created before the description column existed.
+        conn = db.get_connection(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                unit TEXT NOT NULL CHECK (unit IN ('gab.', 'kg'))
+            );
+            INSERT INTO products (code, name, quantity, unit)
+                VALUES ('A-100', 'Widget', 1, 'gab.');
+            """
+        )
+        conn.commit()
+
+        db.init_db(conn)
+
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(products)")]
+        self.assertIn("description", columns)
+        self.assertEqual(db.find_product_by_code(conn, "A-100")["description"], "")
+        conn.close()
+
+    # ----- weight & nutrition -------------------------------------------
+
+    def test_weight_defaults_to_one_and_persists(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
+        self.assertEqual(db.get_product(self.conn, pid)["weight_kg"], 1)
+
+        with_w = db.add_product(self.conn, "B-200", "Bolt", 1, "gab.", "", 0.25)
+        self.assertEqual(db.get_product(self.conn, with_w)["weight_kg"], 0.25)
+
+        db.update_product(self.conn, pid, "A-100", "Widget", 1, "gab.", "", 0.5)
+        self.assertEqual(db.get_product(self.conn, pid)["weight_kg"], 0.5)
+
+    def test_nutrition_defaults_zero_and_persists(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
+        row = db.get_product(self.conn, pid)
+        for field in ("fat", "saturated_fat", "carbs", "sugar", "protein", "salt"):
+            self.assertEqual(row[field], 0)
+
+        db.update_nutrition(self.conn, pid, 10, 3, 20, 5, 8, 1.2)
+        row = db.get_product(self.conn, pid)
+        self.assertEqual(row["fat"], 10)
+        self.assertEqual(row["saturated_fat"], 3)
+        self.assertEqual(row["carbs"], 20)
+        self.assertEqual(row["sugar"], 5)
+        self.assertEqual(row["protein"], 8)
+        self.assertEqual(row["salt"], 1.2)
+
+    def test_energy_from_macros(self) -> None:
+        # 1 g fat = 9 kcal, 1 g carbs = 4 kcal, 1 g protein = 4 kcal.
+        self.assertEqual(db.energy_kcal(10, 20, 5), 10 * 9 + 20 * 4 + 5 * 4)
+        self.assertEqual(db.energy_kcal(10, 20, 5), 190)
+        self.assertAlmostEqual(db.energy_kj(10, 20, 5), 190 * 4.184)
+
+    def test_init_db_adds_missing_weight_and_nutrition_columns(self) -> None:
+        # A database created before weight/nutrition columns existed.
+        conn = db.get_connection(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                unit TEXT NOT NULL CHECK (unit IN ('gab.', 'kg'))
+            );
+            INSERT INTO products (code, name, quantity, unit)
+                VALUES ('A-100', 'Widget', 1, 'gab.');
+            """
+        )
+        conn.commit()
+
+        db.init_db(conn)
+
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(products)")]
+        for col in ("weight_kg", "fat", "saturated_fat", "carbs", "sugar",
+                    "protein", "salt"):
+            self.assertIn(col, columns)
+        row = db.find_product_by_code(conn, "A-100")
+        self.assertEqual(row["weight_kg"], 1)  # default for migrated rows
+        self.assertEqual(row["fat"], 0)
+        conn.close()
+
+    # ----- groups -------------------------------------------------------
+
+    def test_add_and_list_groups_ordered_by_name(self) -> None:
+        db.add_group(self.conn, "Sauces")
+        db.add_group(self.conn, "Breads")
+        names = [g["name"] for g in db.list_groups(self.conn)]
+        self.assertEqual(names, ["Breads", "Sauces"])
+
+    def test_add_group_rejects_empty_name(self) -> None:
+        with self.assertRaises(ValueError):
+            db.add_group(self.conn, "   ")
+
+    def test_products_filtered_by_group(self) -> None:
+        breads = db.add_group(self.conn, "Breads")
+        loaf = db.add_product(self.conn, "A-100", "Loaf", 1, "gab.", "", 0.5, breads)
+        db.add_product(self.conn, "B-200", "Loose", 1, "kg")  # ungrouped
+
+        in_group = [p["code"] for p in db.list_products(self.conn, breads)]
+        self.assertEqual(in_group, ["A-100"])
+        all_codes = [p["code"] for p in db.list_products(self.conn)]
+        self.assertEqual(all_codes, ["A-100", "B-200"])  # None -> everything
+        self.assertEqual(db.get_product(self.conn, loaf)["group_id"], breads)
+
+    def test_set_product_group_moves_position(self) -> None:
+        breads = db.add_group(self.conn, "Breads")
+        pid = db.add_product(self.conn, "A-100", "Loaf", 1, "gab.")
+        self.assertIsNone(db.get_product(self.conn, pid)["group_id"])
+
+        db.set_product_group(self.conn, pid, breads)
+        self.assertEqual(db.get_product(self.conn, pid)["group_id"], breads)
+        db.set_product_group(self.conn, pid, None)
+        self.assertIsNone(db.get_product(self.conn, pid)["group_id"])
+
+    def test_delete_group_ungroups_its_products(self) -> None:
+        breads = db.add_group(self.conn, "Breads")
+        pid = db.add_product(self.conn, "A-100", "Loaf", 1, "gab.", "", 0.5, breads)
+
+        db.delete_group(self.conn, breads)
+        self.assertEqual(db.list_groups(self.conn), [])
+        # The position survives but is now ungrouped (FK ON DELETE SET NULL).
+        self.assertIsNone(db.get_product(self.conn, pid)["group_id"])
+
+    def test_init_db_adds_groups_and_group_id(self) -> None:
+        conn = db.get_connection(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                unit TEXT NOT NULL CHECK (unit IN ('gab.', 'kg'))
+            );
+            INSERT INTO products (code, name, quantity, unit)
+                VALUES ('A-100', 'Widget', 1, 'gab.');
+            """
+        )
+        conn.commit()
+
+        db.init_db(conn)
+
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(products)")]
+        self.assertIn("group_id", columns)
+        self.assertIsNone(db.find_product_by_code(conn, "A-100")["group_id"])
+        # The groups table now exists and is usable.
+        gid = db.add_group(conn, "Breads")
+        self.assertEqual([g["name"] for g in db.list_groups(conn)], ["Breads"])
+        conn.close()
+
     def test_update_product_scales_nested_quantities(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
@@ -84,9 +249,9 @@ class DbLayerTests(unittest.TestCase):
         db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
         db.add_component(self.conn, parent, "B-200", 1)
 
-        # 3 -> 1 is a factor of 1/3; 1 * 1/3 rounds to 0.333.
+        # 3 -> 1 is a factor of 1/3; 1 * 1/3 rounds to 0.33333.
         db.update_product(self.conn, parent, "A-100", "Widget", 1, "gab.")
-        self.assertEqual(db.list_components(self.conn, parent)[0]["quantity"], 0.333)
+        self.assertEqual(db.list_components(self.conn, parent)[0]["quantity"], 0.33333)
 
     def test_update_product_without_quantity_change_leaves_nested(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 2, "gab.")
@@ -106,16 +271,26 @@ class DbLayerTests(unittest.TestCase):
         db.update_product(self.conn, parent, "A-100", "Widget", 4, "gab.")
         self.assertEqual(db.list_components(self.conn, parent)[0]["quantity"], 5)
 
-    def test_quantities_rounded_to_three_decimals(self) -> None:
-        pid = db.add_product(self.conn, "A-100", "Widget", 1.23456, "gab.")
-        self.assertEqual(db.get_product(self.conn, pid)["quantity"], 1.235)
+    def test_quantities_rounded_to_five_decimals(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Widget", 1.234567, "gab.")
+        self.assertEqual(db.get_product(self.conn, pid)["quantity"], 1.23457)
 
         db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        comp_id = db.add_component(self.conn, pid, "B-200", 0.12345)
-        self.assertEqual(db.list_components(self.conn, pid)[0]["quantity"], 0.123)
+        comp_id = db.add_component(self.conn, pid, "B-200", 0.123456)
+        self.assertEqual(db.list_components(self.conn, pid)[0]["quantity"], 0.12346)
 
-        db.update_component(self.conn, comp_id, 9.87654)
-        self.assertEqual(db.list_components(self.conn, pid)[0]["quantity"], 9.877)
+        db.update_component(self.conn, comp_id, 9.876543)
+        self.assertEqual(db.list_components(self.conn, pid)[0]["quantity"], 9.87654)
+
+    def test_format_quantity(self) -> None:
+        # At least 2 decimals, at most 5, trailing zeros dropped in between.
+        self.assertEqual(db.format_quantity(1), "1.00")
+        self.assertEqual(db.format_quantity(1.3), "1.30")
+        self.assertEqual(db.format_quantity(1.30000), "1.30")
+        self.assertEqual(db.format_quantity(1.2345), "1.2345")
+        self.assertEqual(db.format_quantity(1.23456), "1.23456")
+        self.assertEqual(db.format_quantity(1.234567), "1.23457")  # rounded to 5
+        self.assertEqual(db.format_quantity(0), "0.00")
 
     def test_delete_product_cascades_to_components(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
