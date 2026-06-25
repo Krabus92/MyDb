@@ -38,7 +38,9 @@ class MyDbApp(tk.Tk):
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        columns = ("code", "name", "quantity", "unit")
+        # The main window is a catalog of products, not a stock count, so it
+        # shows no quantity — that lives inside each position's card.
+        columns = ("code", "name", "unit")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings")
         for col in columns:
             self.tree.heading(col, text=col.capitalize())
@@ -84,7 +86,7 @@ class MyDbApp(tk.Tk):
         for row in db.list_products(self.conn):
             self.tree.insert(
                 "", tk.END, iid=str(row["id"]),
-                values=(row["code"], row["name"], row["quantity"], row["unit"]),
+                values=(row["code"], row["name"], row["unit"]),
             )
 
     def _selected_id(self) -> int | None:
@@ -184,6 +186,7 @@ class PositionCard(tk.Toplevel):
             self.comp_tree.heading(col, text=text)
             self.comp_tree.column(col, width=110, anchor="w")
         self.comp_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        self.comp_tree.bind("<Double-1>", lambda _e: self.on_edit_component())
 
         form = ttk.Frame(self.comp_frame)
         form.pack(fill="x", padx=5, pady=5)
@@ -191,6 +194,10 @@ class PositionCard(tk.Toplevel):
             form, text="Add nested code", command=self.on_add_component
         )
         self.add_comp_btn.pack(side="left", padx=5)
+        self.edit_comp_btn = ttk.Button(
+            form, text="Edit selected", command=self.on_edit_component
+        )
+        self.edit_comp_btn.pack(side="left", padx=(0, 5))
         self.del_comp_btn = ttk.Button(
             form, text="Delete selected", command=self.on_delete_component
         )
@@ -205,6 +212,14 @@ class PositionCard(tk.Toplevel):
         if self.product_id is None:
             return
         NestedCodePicker(self, self.conn, self.product_id)
+
+    def on_edit_component(self) -> None:
+        selection = self.comp_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select a code", "Pick a nested code to edit.")
+            return
+        code, name, quantity, unit = self.comp_tree.item(selection[0], "values")
+        NestedCodeEditor(self, self.conn, int(selection[0]), code, name, quantity, unit)
 
     def on_delete_component(self) -> None:
         selection = self.comp_tree.selection()
@@ -231,7 +246,7 @@ class PositionCard(tk.Toplevel):
 
     def _set_components_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for widget in (self.add_comp_btn, self.del_comp_btn):
+        for widget in (self.add_comp_btn, self.edit_comp_btn, self.del_comp_btn):
             widget.configure(state=state)
         if enabled:
             self.comp_hint.pack_forget()
@@ -292,12 +307,9 @@ class NestedCodePicker(tk.Toplevel):
         ttk.Label(form, text="Quantity").grid(row=0, column=0, padx=(0, 2))
         self.qty = ttk.Entry(form, width=10)
         self.qty.grid(row=0, column=1, padx=(0, 10))
-        ttk.Label(form, text="Unit").grid(row=0, column=2, padx=(0, 2))
-        self.unit = ttk.Combobox(
-            form, values=list(db.VALID_UNITS), width=6, state="readonly"
-        )
-        self.unit.current(0)
-        self.unit.grid(row=0, column=3)
+        ttk.Label(
+            form, text="Unit follows the chosen position.", foreground="gray"
+        ).grid(row=0, column=2, sticky="w")
 
         buttons = ttk.Frame(self)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
@@ -332,11 +344,72 @@ class NestedCodePicker(tk.Toplevel):
         try:
             db.add_component(
                 self.conn, self.parent_product_id, chosen["code"], quantity,
-                self.unit.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Could not add nested code", str(exc), parent=self)
             return
+        self.card.refresh_components()
+        self.destroy()
+
+
+class NestedCodeEditor(tk.Toplevel):
+    """Edit the quantity and unit of one nested code already on a position.
+
+    The nested code's referenced position (``child_code``) is fixed and shown
+    for reference only; to point at a different position, delete and re-add.
+    """
+
+    def __init__(
+        self,
+        card: PositionCard,
+        conn,
+        component_id: int,
+        child_code: str,
+        child_name: str,
+        quantity: object,
+        unit: str,
+    ) -> None:
+        super().__init__(card)
+        self.card = card
+        self.conn = conn
+        self.component_id = component_id
+
+        self.title("Edit nested code")
+        self.geometry("320x180")
+        self.transient(card)
+        self.grab_set()  # modal: keep focus here until done
+
+        ttk.Label(self, text=f"{child_code} — {child_name}").pack(
+            anchor="w", padx=12, pady=(12, 6)
+        )
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=12, pady=5)
+        ttk.Label(form, text="Quantity").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.qty = ttk.Entry(form, width=14)
+        self.qty.insert(0, str(quantity))
+        self.qty.grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Unit").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(form, text=f"{unit}  (set on the position itself)").grid(
+            row=1, column=1, sticky="w", pady=4
+        )
+
+        buttons = ttk.Frame(self)
+        buttons.pack(fill="x", padx=12, pady=(8, 12))
+        ttk.Button(buttons, text="Save", command=self.on_save).pack(side="right", padx=5)
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+
+        self.qty.focus_set()
+
+    def on_save(self) -> None:
+        try:
+            quantity = float(self.qty.get() or 0)
+        except ValueError:
+            messagebox.showwarning(
+                "Invalid quantity", "Quantity must be a number.", parent=self
+            )
+            return
+        db.update_component(self.conn, self.component_id, quantity)
         self.card.refresh_components()
         self.destroy()
 
