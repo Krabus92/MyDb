@@ -34,8 +34,13 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
 - `db.py` — SQLite data layer: schema, migrations, all read/write helpers, and the
   nutrition math. **All persistence logic lives here** — keep it that way so the
   storage can later be swapped (e.g. for a cloud DB) without touching the GUI.
+- `foodsource.py` — Open Food Facts lookup (search by name or barcode → per-100 g
+  nutrition). The **only** module that uses the network: the GUI calls it, lets
+  the user review, then saves through `db.py`. Stdlib `urllib` only (no new build
+  dependency). `parse_off_product` is a pure, tested mapper.
 - `test_db.py` — unittest tests for `db.py` (each test uses a fresh in-memory DB).
 - `test_app.py` — tests for pure helpers in `app.py` that need no running GUI.
+- `test_foodsource.py` — tests for the pure `parse_off_product` mapper (no network).
 - `build_exe.ps1` / `requirements-dev.txt` — build a standalone Windows `.exe`
   with PyInstaller. Build output (`dist/`, `build/`, `*.spec`) is git-ignored.
 
@@ -127,8 +132,10 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
 quantity scaling, 5-decimal display, description, Latvian input fix, Ok/Cancel
 with confirmations, weight, nutrition entry + per-100 g computed roll-up, groups
 + filtering, right-click menus, product search, nested codes referenced by
-`product_id` (delete-cascade, no orphans, indirect-cycle rejection), and
-standalone **.exe** packaging (`build_exe.ps1`).
+`product_id` (delete-cascade, no orphans, indirect-cycle rejection), standalone
+**.exe** packaging (`build_exe.ps1`), and **Open Food Facts** nutrition import
+(search by name or barcode — fill an existing position's nutrition, or create a
+new position pre-filled from the result).
 
 **Known limitations / good next tasks:**
 - No in-app **export / import / backup** (needed for multi-PC use).

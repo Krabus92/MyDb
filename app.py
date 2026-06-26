@@ -7,10 +7,12 @@ details and its nested codes.
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import db
+import foodsource
 
 
 def fix_baltic_char(char: str) -> str | None:
@@ -119,6 +121,9 @@ class MyDbApp(tk.Tk):
         ttk.Button(
             toolbar, text="New group", command=self.on_new_group
         ).pack(side="left", padx=5)
+        ttk.Button(
+            toolbar, text="Jauns no Open Food Facts", command=self.on_new_from_off
+        ).pack(side="left")
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -175,6 +180,12 @@ class MyDbApp(tk.Tk):
 
     def on_new(self) -> None:
         PositionCard(self, product_id=None)
+
+    def on_new_from_off(self) -> None:
+        """Search Open Food Facts, then open a new card pre-filled from the pick."""
+        def use(product: dict) -> None:
+            PositionCard(self, product_id=None, prefill=product)
+        OpenFoodFactsSearchDialog(self, on_pick=use)
 
     def on_open(self) -> None:
         product_id = self._selected_id()
@@ -319,11 +330,16 @@ class MyDbApp(tk.Tk):
 class PositionCard(tk.Toplevel):
     """A window holding one position's details and its nested codes."""
 
-    def __init__(self, app: MyDbApp, product_id: int | None) -> None:
+    def __init__(
+        self, app: MyDbApp, product_id: int | None, prefill: dict | None = None
+    ) -> None:
         super().__init__(app)
         self.app = app
         self.conn = app.conn
         self.product_id = product_id
+        # Nutrition carried in from an Open Food Facts lookup for a NEW position;
+        # applied on the first save, once the position has an id.
+        self._pending_nutrition: dict | None = None
 
         self.title("New position" if product_id is None else "Position")
         self.geometry("520x620")
@@ -347,6 +363,10 @@ class PositionCard(tk.Toplevel):
 
         if product_id is None:
             self._set_components_enabled(False)
+            if prefill is not None:
+                self._set(self.name, prefill.get("name", ""))
+                self._pending_nutrition = prefill.get("nutrition")
+                self.code.focus_set()  # the one field the user still must fill
         else:
             self._load()
 
@@ -594,6 +614,7 @@ class PositionCard(tk.Toplevel):
                 )
                 self._set_components_enabled(True)
                 self.title("Position")
+                self._apply_pending_nutrition()
             else:
                 db.update_product(
                     self.conn, self.product_id, code, name, quantity, unit,
@@ -607,6 +628,20 @@ class PositionCard(tk.Toplevel):
         self.app.refresh_positions()
         self.refresh_components()
         return True
+
+    def _apply_pending_nutrition(self) -> None:
+        """Write nutrition carried in from an Open Food Facts pre-fill, now that
+        the new position has an id. Missing values (None) count as 0."""
+        if self._pending_nutrition is None:
+            return
+        nv = self._pending_nutrition
+        db.update_nutrition(
+            self.conn, self.product_id,
+            nv.get("fat") or 0, nv.get("saturated_fat") or 0,
+            nv.get("carbs") or 0, nv.get("sugar") or 0,
+            nv.get("protein") or 0, nv.get("salt") or 0,
+        )
+        self._pending_nutrition = None
 
     def _load(self) -> None:
         row = db.get_product(self.conn, self.product_id)
@@ -913,7 +948,7 @@ class NutritionWindow(tk.Toplevel):
         self.product_id = product_id
 
         self.title("Uzturvielas (uz 100 g)")
-        self.geometry("360x360")
+        self.geometry("440x380")
         self.transient(card)
         self.grab_set()
 
@@ -956,7 +991,23 @@ class NutritionWindow(tk.Toplevel):
         buttons.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(buttons, text="Save", command=self.on_save).pack(side="right", padx=5)
         ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(
+            buttons, text="Meklēt no Open Food Facts", command=self._search_off
+        ).pack(side="left")
 
+        self._recompute()
+
+    def _search_off(self) -> None:
+        """Look up a product and fill the six fields (for review, not auto-save)."""
+        OpenFoodFactsSearchDialog(self, on_pick=self._apply_off)
+
+    def _apply_off(self, product: dict) -> None:
+        nutrition = product.get("nutrition") or {}
+        for field, _ in self.FIELDS:
+            value = nutrition.get(field)
+            if value is not None:  # leave fields the product didn't provide
+                self.entries[field].delete(0, tk.END)
+                self.entries[field].insert(0, db.format_quantity(value))
         self._recompute()
 
     def _values(self) -> dict[str, float]:
@@ -981,6 +1032,129 @@ class NutritionWindow(tk.Toplevel):
             v["fat"], v["saturated_fat"], v["carbs"], v["sugar"], v["protein"], v["salt"],
         )
         self.destroy()
+
+
+class OpenFoodFactsSearchDialog(tk.Toplevel):
+    """Search Open Food Facts by name or barcode and pick a product.
+
+    On selection calls ``on_pick(product)`` (a parsed dict with ``name`` and
+    ``nutrition``) and closes. Network calls run on a background thread, so the
+    window never freezes, and results are marshalled back via ``after()``.
+    """
+
+    def __init__(self, parent: tk.Misc, on_pick) -> None:
+        super().__init__(parent)
+        self.on_pick = on_pick
+        self._results: list[dict] = []
+
+        self.title("Open Food Facts")
+        self.geometry("540x460")
+        self.transient(parent)
+        self.grab_set()
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text="Nosaukums / svītrkods").pack(side="left")
+        self.query = ttk.Entry(top)
+        self.query.pack(side="left", fill="x", expand=True, padx=5)
+        enable_latvian_input(self.query)
+        self.query.bind("<Return>", lambda _e: self.on_search_name())
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", padx=10, pady=(0, 4))
+        self.name_btn = ttk.Button(
+            actions, text="Meklēt pēc nosaukuma", command=self.on_search_name
+        )
+        self.name_btn.pack(side="left")
+        self.barcode_btn = ttk.Button(
+            actions, text="Pēc svītrkoda", command=self.on_search_barcode
+        )
+        self.barcode_btn.pack(side="left", padx=5)
+        self.status = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.status).pack(side="left", padx=8)
+
+        area = ttk.Frame(self)
+        area.pack(fill="both", expand=True, padx=10, pady=4)
+        self.tree = ttk.Treeview(area, columns=("name", "code"), show="headings")
+        self.tree.heading("name", text="Produkts")
+        self.tree.heading("code", text="Svītrkods")
+        self.tree.column("name", width=350, anchor="w")
+        self.tree.column("code", width=140, anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(area, orient="vertical", command=self.tree.yview)
+        scroll.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<Double-1>", lambda _e: self.on_choose())
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bottom, text="Izvēlēties", command=self.on_choose).pack(
+            side="right", padx=5
+        )
+        ttk.Button(bottom, text="Atcelt", command=self.destroy).pack(side="right")
+
+        self.query.focus_set()
+
+    def on_search_name(self) -> None:
+        text = self.query.get().strip()
+        if text:
+            self._run(lambda: foodsource.search_by_name(text))
+
+    def on_search_barcode(self) -> None:
+        code = self.query.get().strip()
+        if not code:
+            return
+
+        def fetch() -> list[dict]:
+            product = foodsource.fetch_by_barcode(code)
+            return [product] if product else []
+
+        self._run(fetch)
+
+    def _run(self, fetch) -> None:
+        """Run a fetch function off the UI thread and show its results."""
+        self.status.set("Meklē…")
+        self._set_buttons("disabled")
+
+        def worker() -> None:
+            try:
+                results, error = fetch(), None
+            except Exception as exc:  # offline / network / bad response
+                results, error = [], exc
+            self.after(0, lambda: self._show(results, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show(self, results: list[dict], error: Exception | None) -> None:
+        self._set_buttons("normal")
+        self.tree.delete(*self.tree.get_children())
+        self._results = results
+        if error is not None:
+            self.status.set("Kļūda: nav savienojuma vai meklēšana neizdevās.")
+            return
+        if not results:
+            self.status.set("Nekas nav atrasts.")
+            return
+        self.status.set(f"Atrasts: {len(results)}")
+        for i, product in enumerate(results):
+            self.tree.insert(
+                "", tk.END, iid=str(i),
+                values=(product.get("name") or "(bez nosaukuma)",
+                        product.get("code") or ""),
+            )
+
+    def _set_buttons(self, state: str) -> None:
+        self.name_btn.configure(state=state)
+        self.barcode_btn.configure(state=state)
+
+    def on_choose(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            self.status.set("Izvēlieties produktu no saraksta.")
+            return
+        product = self._results[int(selection[0])]
+        self.destroy()  # release the grab before handing control back
+        self.on_pick(product)
 
 
 if __name__ == "__main__":
