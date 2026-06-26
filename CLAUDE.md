@@ -43,7 +43,8 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
 
 - **products** (a "position"): `code` (UNIQUE), `name`, `quantity`, `unit`
   (`'gab.'` or `'kg'`), `description`, `weight_kg`, six per-100 g nutrition columns
-  (`fat, saturated_fat, carbs, sugar, protein, salt`), `group_id` (nullable).
+  (`fat, saturated_fat, carbs, sugar, protein, salt`), `group_id` (nullable), and
+  `show_computed` (0/1 — whether the card reopens with the computed panel shown).
 - **components** (a "nested code" — one ingredient line of a recipe):
   `parent_product_id` (FK → products, `ON DELETE CASCADE`), `child_product_id`
   (FK → products, `ON DELETE CASCADE` — the nested position), `quantity`. A
@@ -86,7 +87,9 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
   codes) returns its stored values. The card shows this in a right-side panel when
   the checkbox right of `uzturvielas` is ticked, and it updates live as you edit
   weight/quantity; while it is shown the manual `uzturvielas` editor is **disabled**
-  so manual values can't conflict with the computed ones.
+  so manual values can't conflict with the computed ones. The checkbox state is
+  saved per position (`show_computed`), so a card reopens as you left it, and the
+  window auto-sizes (`geometry("")`) to fit the panel rather than clipping it.
 - **Decimals:** values are stored to 5 decimals (`QUANTITY_DECIMALS`) and shown via
   `db.format_quantity()` — always ≥2 and ≤5 decimals, trailing zeros trimmed
   (`1` → `1.00`, `1.3` → `1.30`, `1.23456` → `1.23456`).
