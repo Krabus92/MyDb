@@ -41,6 +41,20 @@ python app.py
 
 The first run creates `mydb.sqlite3` automatically.
 
+## Building a standalone `.exe`
+
+To get a single program file that runs **without** Python installed (so you can
+double-click it, or point a desktop shortcut at it), build it with
+[PyInstaller](https://pyinstaller.org/):
+
+```powershell
+.\build_exe.ps1
+```
+
+This produces `dist\MyDb.exe`. Copy that file to any Windows PC and run it — no
+Python needed. The app keeps its database (`mydb.sqlite3`) in the same folder as
+the `.exe`.
+
 ## Project layout
 
 | File        | Purpose                                          |
@@ -54,4 +68,4 @@ The first run creates `mydb.sqlite3` automatically.
 - [x] Positions: create, list, open in a card, edit, delete
 - [x] Nested codes that reference another position (name resolved automatically)
 - [ ] Search / filter positions
-- [ ] Package as a standalone `.exe` (PyInstaller)
+- [x] Package as a standalone `.exe` (PyInstaller)
