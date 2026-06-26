@@ -83,7 +83,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             protein       REAL NOT NULL DEFAULT 0,
             salt          REAL NOT NULL DEFAULT 0,
             -- Optional group; NULL means ungrouped (shown only under "All").
-            group_id      INTEGER REFERENCES groups (id) ON DELETE SET NULL
+            group_id      INTEGER REFERENCES groups (id) ON DELETE SET NULL,
+            -- Whether the card opens with the computed-nutrition panel shown.
+            show_computed INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS components (
@@ -117,6 +119,7 @@ def _migrate_add_product_columns(conn: sqlite3.Connection) -> None:
         ("protein", "REAL NOT NULL DEFAULT 0"),
         ("salt", "REAL NOT NULL DEFAULT 0"),
         ("group_id", "INTEGER REFERENCES groups (id) ON DELETE SET NULL"),
+        ("show_computed", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for name, decl in additions:
         if name not in existing:
@@ -256,7 +259,7 @@ def energy_kj(fat: float, carbs: float, protein: float) -> float:
 #: Every column read back for a position, in a single place.
 _PRODUCT_FIELDS = (
     "id, code, name, quantity, unit, description, weight_kg, "
-    "fat, saturated_fat, carbs, sugar, protein, salt, group_id"
+    "fat, saturated_fat, carbs, sugar, protein, salt, group_id, show_computed"
 )
 
 
@@ -419,6 +422,17 @@ def set_product_group(
     """Move a position into a group (or out of any group when ``None``)."""
     conn.execute(
         "UPDATE products SET group_id = ? WHERE id = ?", (group_id, product_id)
+    )
+    conn.commit()
+
+
+def set_show_computed(
+    conn: sqlite3.Connection, product_id: int, show: bool
+) -> None:
+    """Remember whether this position's card opens with the computed panel shown."""
+    conn.execute(
+        "UPDATE products SET show_computed = ? WHERE id = ?",
+        (1 if show else 0, product_id),
     )
     conn.commit()
 

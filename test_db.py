@@ -77,6 +77,15 @@ class DbLayerTests(unittest.TestCase):
         pid = db.add_product(self.conn, "A-100", "Widget", 1, "gab.", "a note")
         self.assertEqual(db.get_product(self.conn, pid)["description"], "a note")
 
+    def test_show_computed_defaults_off_and_persists(self) -> None:
+        pid = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
+        self.assertEqual(db.get_product(self.conn, pid)["show_computed"], 0)
+
+        db.set_show_computed(self.conn, pid, True)
+        self.assertEqual(db.get_product(self.conn, pid)["show_computed"], 1)
+        db.set_show_computed(self.conn, pid, False)
+        self.assertEqual(db.get_product(self.conn, pid)["show_computed"], 0)
+
     def test_init_db_adds_missing_description_column(self) -> None:
         # Simulate a database created before the description column existed.
         conn = db.get_connection(":memory:")

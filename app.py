@@ -327,6 +327,7 @@ class PositionCard(tk.Toplevel):
 
         self.title("New position" if product_id is None else "Position")
         self.geometry("520x620")
+        self.minsize(520, 620)  # auto-sizing (geometry("")) never shrinks below this
         self.transient(app)
 
         # Everything lives in a left "content" column; a computed-nutrition
@@ -434,14 +435,16 @@ class PositionCard(tk.Toplevel):
         if self.show_nutrition_var.get():
             self._refresh_nutrition_panel()
             self.nutrition_panel.pack(side="right", fill="y", padx=(0, 10), pady=10)
-            self.geometry("820x620")
             # The computed roll-up replaces manual values, so editing them while
             # it is shown would conflict with the logic; block it.
             self.nutrition_btn.configure(state="disabled")
         else:
             self.nutrition_panel.pack_forget()
-            self.geometry("520x620")
             self.nutrition_btn.configure(state="normal")
+        # Let Tk size the window to exactly fit the current layout, so the panel
+        # (long labels + numbers) is never clipped and we shrink back when hidden.
+        self.update_idletasks()
+        self.geometry("")
 
     def _refresh_nutrition_panel(self) -> None:
         """Show the per-100 g roll-up. For a recipe, divide the nested-code
@@ -599,6 +602,8 @@ class PositionCard(tk.Toplevel):
         except Exception as exc:  # e.g. duplicate code
             messagebox.showerror("Could not save", str(exc), parent=self)
             return False
+        # Remember whether this position's card opens with the computed panel.
+        db.set_show_computed(self.conn, self.product_id, self.show_nutrition_var.get())
         self.app.refresh_positions()
         self.refresh_components()
         return True
@@ -621,6 +626,9 @@ class PositionCard(tk.Toplevel):
         )
         self.group.set(group_name)
         self.refresh_components()
+        # Reopen with the computed panel shown if it was when last saved.
+        self.show_nutrition_var.set(bool(row["show_computed"]))
+        self._toggle_nutrition_panel()
 
     # ----- nested codes (bottom) ----------------------------------------
 
