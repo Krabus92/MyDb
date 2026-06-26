@@ -360,6 +360,9 @@ class PositionCard(tk.Toplevel):
         self.quantity = self._field(frame, "Quantity", 2)
         enable_latvian_input(self.code)
         enable_latvian_input(self.name)
+        # Quantity and weight feed the per-100 g basis, so update the computed
+        # panel live as they are typed (when it is shown).
+        self.quantity.bind("<KeyRelease>", lambda _e: self._on_basis_changed())
 
         ttk.Label(frame, text="Unit").grid(row=3, column=0, sticky="e", padx=5, pady=3)
         self.unit = ttk.Combobox(
@@ -367,7 +370,10 @@ class PositionCard(tk.Toplevel):
         )
         self.unit.current(0)
         self.unit.grid(row=3, column=1, sticky="w", padx=5, pady=3)
-        self.unit.bind("<<ComboboxSelected>>", lambda _e: self._sync_weight_row())
+        self.unit.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: (self._sync_weight_row(), self._on_basis_changed()),
+        )
 
         # Weight (kg) only applies to piece-counted ('gab.') positions; a 'kg'
         # position is 1 kg per unit. The row is shown only when unit == 'gab.'.
@@ -375,6 +381,7 @@ class PositionCard(tk.Toplevel):
         self.weight = ttk.Entry(frame, width=30)
         self.weight_label.grid(row=4, column=0, sticky="e", padx=5, pady=3)
         self.weight.grid(row=4, column=1, sticky="w", padx=5, pady=3)
+        self.weight.bind("<KeyRelease>", lambda _e: self._on_basis_changed())
 
         ttk.Label(frame, text="Group").grid(row=5, column=0, sticky="e", padx=5, pady=3)
         self.group = ttk.Combobox(frame, width=27, state="readonly")
@@ -384,13 +391,20 @@ class PositionCard(tk.Toplevel):
         buttons = ttk.Frame(frame)
         buttons.grid(row=6, column=1, sticky="w", padx=5, pady=5)
         ttk.Button(buttons, text="Save", command=self.on_save).pack(side="left")
-        ttk.Button(
+        self.nutrition_btn = ttk.Button(
             buttons, text="uzturvielas", command=self.on_nutrition
-        ).pack(side="left", padx=5)
+        )
+        self.nutrition_btn.pack(side="left", padx=5)
         ttk.Checkbutton(
             buttons, text="rādīt aprēķināto", variable=self.show_nutrition_var,
             command=self._toggle_nutrition_panel,
         ).pack(side="left")
+
+    def _on_basis_changed(self) -> None:
+        """A weight/quantity/unit edit changes the per-100 g basis; refresh the
+        computed panel live if it is currently shown."""
+        if self.show_nutrition_var.get():
+            self._refresh_nutrition_panel()
 
     # ----- computed nutrition panel (right) -----------------------------
 
@@ -421,17 +435,30 @@ class PositionCard(tk.Toplevel):
             self._refresh_nutrition_panel()
             self.nutrition_panel.pack(side="right", fill="y", padx=(0, 10), pady=10)
             self.geometry("820x620")
+            # The computed roll-up replaces manual values, so editing them while
+            # it is shown would conflict with the logic; block it.
+            self.nutrition_btn.configure(state="disabled")
         else:
             self.nutrition_panel.pack_forget()
             self.geometry("520x620")
+            self.nutrition_btn.configure(state="normal")
 
     def _refresh_nutrition_panel(self) -> None:
-        """Recompute the per-100 g roll-up from nested positions and show it."""
+        """Show the per-100 g roll-up. For a recipe, divide the nested-code
+        totals by the position's *live* declared mass (the weight/quantity as
+        currently typed), so the panel reacts before you even save."""
         if self.product_id is None:
             for var in self.nutrition_vars.values():
                 var.set("—")
             return
-        n = db.effective_nutrition(self.conn, self.product_id)
+        totals = db.recipe_nutrient_grams(self.conn, self.product_id)
+        if totals is None:
+            # Raw position: just its stored per-100 g values.
+            n = db.effective_nutrition(self.conn, self.product_id)
+        else:
+            basis = db.position_mass_grams(self._live_weight(), self._live_quantity())
+            n = {k: (totals[k] / basis * 100.0 if basis > 0 else 0.0)
+                 for k in db.NUTRIENTS}
         for key in db.NUTRIENTS:
             self.nutrition_vars[key].set(db.format_quantity(n[key]))
         self.nutrition_vars["kcal"].set(
@@ -440,6 +467,21 @@ class PositionCard(tk.Toplevel):
         self.nutrition_vars["kj"].set(
             db.format_quantity(db.energy_kj(n["fat"], n["carbs"], n["protein"]))
         )
+
+    def _live_weight(self) -> float:
+        """Weight per unit from the form: the weight field for 'gab.', else 1."""
+        if self.unit.get() != "gab.":
+            return 1.0
+        try:
+            return float(self.weight.get() or 1)
+        except ValueError:
+            return 1.0
+
+    def _live_quantity(self) -> float:
+        try:
+            return float(self.quantity.get() or 0)
+        except ValueError:
+            return 0.0
 
     def _reload_groups(self) -> None:
         """Fill the group dropdown with '(no group)' plus every existing group."""
@@ -466,6 +508,14 @@ class PositionCard(tk.Toplevel):
         if self.product_id is None:
             messagebox.showinfo(
                 "Save first", "Save the position before adding nutrition.", parent=self
+            )
+            return
+        if self.show_nutrition_var.get():
+            messagebox.showinfo(
+                "Computed nutrition shown",
+                "Uncheck 'rādīt aprēķināto' to edit values manually. While the "
+                "computed roll-up is shown, manual values would conflict with it.",
+                parent=self,
             )
             return
         NutritionWindow(self, self.conn, self.product_id)

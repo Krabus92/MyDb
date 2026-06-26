@@ -74,11 +74,19 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
   window) for raw ingredients. `kcal = fat×9 + carbs×4 + protein×4`;
   `kJ = kcal × 4.184`.
 - **Computed nutrition roll-up** (`db.effective_nutrition`): a position WITH nested
-  codes is a recipe; its per-100 g nutrition is computed by mass from its
-  ingredients (each ingredient's per-100 g × its grams, summed, ÷ total grams ×
-  100). It **recurses** into sub-recipes and is **cycle-safe** (a `_visiting` set).
-  A raw position (no nested codes) just returns its stored values. The card shows
-  this in a right-side panel when the checkbox right of `uzturvielas` is ticked.
+  codes is a recipe; its per-100 g nutrition is the nutrients its ingredients
+  contribute (each ingredient's per-100 g × its grams, summed — see
+  `db.recipe_nutrient_grams`) **÷ the position's OWN declared mass** (
+  `db.position_mass_grams` = `weight_kg × quantity × 1000` g; quantity 0 counts as
+  one unit) × 100. So the position's *own weight* is the 100 g basis — a 1 kg
+  position holding 2 kg of an ingredient is **twice as concentrated** as that
+  ingredient (think cooking-down / reduction). It **recurses** into sub-recipes
+  and is **cycle-safe** (a `_visiting` set); per-100 g is invariant to quantity
+  (nested codes scale with it, so the basis scales too). A raw position (no nested
+  codes) returns its stored values. The card shows this in a right-side panel when
+  the checkbox right of `uzturvielas` is ticked, and it updates live as you edit
+  weight/quantity; while it is shown the manual `uzturvielas` editor is **disabled**
+  so manual values can't conflict with the computed ones.
 - **Decimals:** values are stored to 5 decimals (`QUANTITY_DECIMALS`) and shown via
   `db.format_quantity()` — always ≥2 and ≤5 decimals, trailing zeros trimmed
   (`1` → `1.00`, `1.3` → `1.30`, `1.23456` → `1.23456`).

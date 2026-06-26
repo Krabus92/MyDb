@@ -549,38 +549,42 @@ def delete_component(conn: sqlite3.Connection, component_id: int) -> None:
 # ----- computed nutrition ----------------------------------------------
 
 
-def effective_nutrition(
+def position_mass_grams(weight_kg: float, quantity: float) -> float:
+    """Declared mass of a position in grams: weight per unit x units x 1000.
+
+    A ``kg`` position has ``weight_kg`` forced to 1, so its mass is its quantity
+    in kilograms; a ``gab.`` position weighs ``weight_kg`` per piece. A quantity
+    of 0 is treated as one unit, so a recipe defined at quantity 0 (a template,
+    not stock) still has a per-100 g basis.
+    """
+    units = quantity if quantity and quantity > 0 else 1
+    return float(weight_kg) * float(units) * 1000.0
+
+
+def recipe_nutrient_grams(
     conn: sqlite3.Connection,
     product_id: int,
     _visiting: frozenset[int] = frozenset(),
-) -> dict[str, float]:
-    """Nutrition per 100 g of a position, as a dict over :data:`NUTRIENTS`.
+) -> dict[str, float] | None:
+    """Total grams of each nutrient a position's nested codes contribute.
 
-    A position made of nested codes is a recipe: its nutrition is rolled up from
-    its ingredients by weight. A raw position (no nested codes) contributes its
-    own stored per-100 g values. The roll-up recurses, so an ingredient that is
-    itself a recipe uses its computed values; ``_visiting`` breaks any cycles.
+    Returns ``None`` for a *raw* position (no nested codes) or one already being
+    visited (a cycle) — neither has a rolled-up total. Otherwise returns, summed
+    over every nested code, ``ingredient_mass_g / 100 * ingredient_per100g``,
+    where each ingredient's per-100 g is itself :func:`effective_nutrition` (so
+    sub-recipes recurse). A nested code's mass in grams is
+    ``quantity * child.weight_kg * 1000`` (a ``kg`` child is 1 kg/unit, a ``gab.``
+    child uses its per-piece weight).
 
-    For each nested code of ``quantity`` of a child position:
-
-    * its mass in grams is ``quantity * child.weight_kg * 1000`` (a ``kg`` child
-      is 1 kg/unit, a ``gab.`` child uses its per-piece weight);
-    * it contributes ``grams / 100 * child_nutrient`` of each nutrient.
-
-    Summing masses and nutrient totals and dividing back by the total grams (then
-    times 100) gives the recipe's nutrition per 100 g.
+    This is the *numerator* of the per-100 g roll-up; :func:`effective_nutrition`
+    divides it by the position's own declared mass.
     """
-    row = get_product(conn, product_id)
-    if row is None:
-        return {n: 0.0 for n in NUTRIENTS}
-
+    if product_id in _visiting:
+        return None
     components = list_components(conn, product_id)
-    if not components or product_id in _visiting:
-        # Raw ingredient (or a cycle): use the stored per-100 g values.
-        return {n: float(row[n]) for n in NUTRIENTS}
-
+    if not components:
+        return None
     visiting = _visiting | {product_id}
-    total_grams = 0.0
     totals = {n: 0.0 for n in NUTRIENTS}
     for comp in components:
         child = get_product(conn, comp["child_product_id"])
@@ -590,10 +594,35 @@ def effective_nutrition(
         if grams <= 0:
             continue
         child_nutrition = effective_nutrition(conn, child["id"], visiting)
-        total_grams += grams
         for n in NUTRIENTS:
             totals[n] += grams / 100.0 * child_nutrition[n]
+    return totals
 
-    if total_grams <= 0:
+
+def effective_nutrition(
+    conn: sqlite3.Connection,
+    product_id: int,
+    _visiting: frozenset[int] = frozenset(),
+) -> dict[str, float]:
+    """Nutrition per 100 g of a position, as a dict over :data:`NUTRIENTS`.
+
+    A position made of nested codes is a recipe: its per-100 g is the nutrients
+    its ingredients contribute (:func:`recipe_nutrient_grams`) divided by the
+    position's **own declared mass** (:func:`position_mass_grams`), times 100. So
+    a 1 kg position holding 2 kg of an ingredient is twice as concentrated as
+    that ingredient — the position's weight, not the ingredient total, is the
+    100 g basis. The roll-up recurses into sub-recipes and is cycle-safe.
+
+    A raw position (no nested codes) returns its own stored per-100 g values.
+    """
+    row = get_product(conn, product_id)
+    if row is None:
         return {n: 0.0 for n in NUTRIENTS}
-    return {n: totals[n] / total_grams * 100.0 for n in NUTRIENTS}
+    totals = recipe_nutrient_grams(conn, product_id, _visiting)
+    if totals is None:
+        # Raw ingredient (or a cycle): use the stored per-100 g values.
+        return {n: float(row[n]) for n in NUTRIENTS}
+    basis = position_mass_grams(row["weight_kg"], row["quantity"])
+    if basis <= 0:
+        return {n: 0.0 for n in NUTRIENTS}
+    return {n: totals[n] / basis * 100.0 for n in NUTRIENTS}
