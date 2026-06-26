@@ -18,7 +18,9 @@ Long-term goals the user has stated: full **recipe + nutrition-label output**,
 
 - Run the app (no console window): `pythonw app.py`
 - Run with a console (to see errors while debugging): `python app.py`
-- Tests (run from the project directory): `python -m unittest` — ~44 tests.
+- Tests (run from the project directory): `python -m unittest` — ~47 tests.
+- Build a standalone `.exe` (no Python needed to run it): `.\build_exe.ps1` →
+  `dist\MyDb.exe`. The packaged app stores its database next to the `.exe`.
 - `mydb.sqlite3` is created next to the code on first run. It is **local data and
   git-ignored**, so it does NOT travel with the repo (see "Data & deployment").
 
@@ -34,6 +36,8 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
   storage can later be swapped (e.g. for a cloud DB) without touching the GUI.
 - `test_db.py` — unittest tests for `db.py` (each test uses a fresh in-memory DB).
 - `test_app.py` — tests for pure helpers in `app.py` that need no running GUI.
+- `build_exe.ps1` / `requirements-dev.txt` — build a standalone Windows `.exe`
+  with PyInstaller. Build output (`dist/`, `build/`, `*.spec`) is git-ignored.
 
 ## Data model (tables, all defined in `db.py:init_db`)
 
@@ -41,19 +45,24 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
   (`'gab.'` or `'kg'`), `description`, `weight_kg`, six per-100 g nutrition columns
   (`fat, saturated_fat, carbs, sugar, protein, salt`), `group_id` (nullable).
 - **components** (a "nested code" — one ingredient line of a recipe):
-  `parent_product_id` (FK → products, `ON DELETE CASCADE`), `child_code` (the
-  *code* of another position), `quantity`. A component has **no unit or name of
-  its own**; they are resolved live from the referenced position.
+  `parent_product_id` (FK → products, `ON DELETE CASCADE`), `child_product_id`
+  (FK → products, `ON DELETE CASCADE` — the nested position), `quantity`. A
+  component has **no unit or name of its own**; they are resolved live from the
+  referenced position.
 - **groups**: `id`, `name` (UNIQUE). A product optionally belongs to one group;
   deleting a group ungroups its products (`ON DELETE SET NULL`).
 
 ## Key design decisions (the "why")
 
-- **A nested code references another position and stores only a quantity.** Its
-  name *and unit* are looked up from the referenced position (`list_components`
-  joins `products` on `code`). So a position's unit is set in ONE place and every
-  nesting of it follows automatically. (Units used to be stored per-nesting; that
-  was wrong and has been migrated away.)
+- **A nested code references another position by id and stores only a quantity.**
+  Its code, name *and unit* are looked up from the referenced position
+  (`list_components` joins `products` on `id` via `child_product_id`). So a
+  position's unit is set in ONE place and every nesting of it follows
+  automatically, renaming a code is reflected with no cascade, and deleting a
+  position removes the nested lines that used it (FK `ON DELETE CASCADE`).
+  `add_component` rejects self-nesting and indirect cycles (A→B→A). (Earlier
+  versions stored a per-nesting unit, and referenced the child by its code
+  string; both were wrong and have been migrated away.)
 - **Unit meaning / weight:** `kg` → the quantity is kilograms (1 unit = 1 kg).
   `gab.` → pieces, and each piece weighs `weight_kg`. So a component's mass is
   `quantity × child.weight_kg × 1000` grams for both units. `weight_kg` is forced
@@ -106,17 +115,14 @@ Environment: Windows, Python 3.13, Tcl/Tk 8.6.15. The shell is PowerShell.
 **Done:** per-position cards, nested-code picker/edit, shared unit + migration,
 quantity scaling, 5-decimal display, description, Latvian input fix, Ok/Cancel
 with confirmations, weight, nutrition entry + per-100 g computed roll-up, groups
-+ filtering, right-click menus, product search, and code-rename cascade.
++ filtering, right-click menus, product search, nested codes referenced by
+`product_id` (delete-cascade, no orphans, indirect-cycle rejection), and
+standalone **.exe** packaging (`build_exe.ps1`).
 
 **Known limitations / good next tasks:**
-- References are by `code` string, not an id FK. Renames now cascade
-  (`update_product`), but **deleting** an ingredient still orphans nested codes to
-  `(unknown)`, and **indirect cycles** (A→B→A) are not rejected (only direct
-  self-nesting is). A more robust fix is to reference children by `product_id`.
 - No in-app **export / import / backup** (needed for multi-PC use).
 - Decimal input only accepts `.` (Latvian users may type `,`).
 - Planned features: printable **recipe + nutrition-label** output, **cost**
-  tracking, **cloud/shared DB** for multiple users, standalone **.exe** packaging
-  (see open PR #3, branch `feat/exe-packaging`).
+  tracking, and a **cloud/shared DB** for multiple users.
 - No CI yet — running `python -m unittest` in GitHub Actions on push would guard
   the test suite.
