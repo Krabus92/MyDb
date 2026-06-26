@@ -17,10 +17,25 @@ the storage logic stays in one place and is easy to test.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
-#: Default location of the database file (next to this module).
-DB_PATH = Path(__file__).with_name("mydb.sqlite3")
+
+def _base_dir() -> Path:
+    """Folder the database should live in.
+
+    When running as a PyInstaller one-file ``.exe``, ``__file__`` points inside
+    a temporary extraction folder that is deleted on exit, so the database is
+    stored next to the executable instead. Otherwise it sits next to this
+    source file.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+#: Default location of the database file.
+DB_PATH = _base_dir() / "mydb.sqlite3"
 
 #: The only units a position or nested code may use.
 VALID_UNITS = ("gab.", "kg")

@@ -1,0 +1,3 @@
+# Build-time dependencies (not needed to run the app from source).
+# Install with:  python -m pip install -r requirements-dev.txt
+pyinstaller
