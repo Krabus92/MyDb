@@ -3,12 +3,14 @@
 Holds two tables:
 
 * ``products``   — one row per position (code, name, quantity, unit)
-* ``components`` — codes nested under a position, each with its own quantity
+* ``components`` — positions nested under another, each with its own quantity
 
-A nested code refers to *another position* by its ``code``. The position's name
-is not copied into the components table; it is looked up by joining back to
-``products`` (see :func:`list_components`), so a nested code always shows the
-current name of the position it points to.
+A nested code references *another position* by its id (``child_product_id``).
+Its code, name and unit are not copied into the components table; they are read
+live by joining back to ``products`` (see :func:`list_components`), so a nested
+code always reflects the current state of the position it points to — renaming
+that position is automatic, and deleting it removes the nested lines that used
+it (foreign key ``ON DELETE CASCADE``).
 
 The GUI in :mod:`app` talks to the database only through the helpers here, so
 the storage logic stays in one place and is easy to test.
@@ -72,15 +74,18 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS components (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
             parent_product_id INTEGER NOT NULL,
-            child_code        TEXT NOT NULL,
+            child_product_id  INTEGER NOT NULL,
             quantity          REAL NOT NULL DEFAULT 0,
             FOREIGN KEY (parent_product_id)
+                REFERENCES products (id) ON DELETE CASCADE,
+            FOREIGN KEY (child_product_id)
                 REFERENCES products (id) ON DELETE CASCADE
         );
         """
     )
     _migrate_drop_component_unit(conn)
     _migrate_add_product_columns(conn)
+    _migrate_components_to_product_id(conn)
     conn.commit()
 
 
@@ -126,6 +131,45 @@ def _migrate_drop_component_unit(conn: sqlite3.Connection) -> None:
 
         INSERT INTO components_new (id, parent_product_id, child_code, quantity)
             SELECT id, parent_product_id, child_code, quantity FROM components;
+
+        DROP TABLE components;
+        ALTER TABLE components_new RENAME TO components;
+        """
+    )
+
+
+def _migrate_components_to_product_id(conn: sqlite3.Connection) -> None:
+    """Replace the legacy ``components.child_code`` text with a ``child_product_id``.
+
+    Older versions referenced a nested position by its *code* string. Referencing
+    it by id instead means: renames need no cascade (the join is by id), deleting
+    an ingredient cleanly removes the nested lines that used it (FK ``ON DELETE
+    CASCADE``) instead of orphaning them to ``(unknown)``, and cycles can be
+    detected reliably. Nested rows whose old ``child_code`` matched no position
+    (references that were already orphaned) are dropped, since an id reference
+    must point at a real position.
+    """
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(components)")]
+    if "child_code" not in columns:
+        return
+    conn.executescript(
+        """
+        CREATE TABLE components_new (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_product_id INTEGER NOT NULL,
+            child_product_id  INTEGER NOT NULL,
+            quantity          REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (parent_product_id)
+                REFERENCES products (id) ON DELETE CASCADE,
+            FOREIGN KEY (child_product_id)
+                REFERENCES products (id) ON DELETE CASCADE
+        );
+
+        INSERT INTO components_new
+                (id, parent_product_id, child_product_id, quantity)
+            SELECT c.id, c.parent_product_id, p.id, c.quantity
+            FROM components c
+            JOIN products p ON p.code = c.child_code;
 
         DROP TABLE components;
         ALTER TABLE components_new RENAME TO components;
@@ -281,9 +325,9 @@ def update_product(
 ) -> None:
     """Update a position's main fields (everything except its nutrition).
 
-    If the position's code changes, every nested code that referenced the old
-    code is repointed to the new one, so recipes that use this position keep
-    working instead of orphaning to ``(unknown)``.
+    The position's code may change freely: nested codes reference positions by
+    id, so a rename is reflected automatically and never orphans the recipes
+    that use this position.
 
     If the position's quantity changes, its nested codes are scaled by the same
     factor: a nested quantity is the amount needed for the position's *current*
@@ -305,11 +349,6 @@ def update_product(
             group_id, product_id,
         ),
     )
-    if old is not None and old["code"] != code:
-        conn.execute(
-            "UPDATE components SET child_code = ? WHERE child_code = ?",
-            (code, old["code"]),
-        )
     if old is not None and old["quantity"] > 0 and quantity != old["quantity"]:
         factor = quantity / old["quantity"]
         conn.execute(
@@ -396,30 +435,51 @@ def delete_group(conn: sqlite3.Connection, group_id: int) -> None:
 # ----- nested codes (components) ---------------------------------------
 
 
+def _reaches(conn: sqlite3.Connection, start_id: int, target_id: int) -> bool:
+    """True if ``target_id`` can be reached from ``start_id`` by following nested
+    codes. Used to reject cycles (e.g. A→B→A) before they are created."""
+    seen: set[int] = set()
+    stack = [start_id]
+    while stack:
+        node = stack.pop()
+        if node == target_id:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        for row in conn.execute(
+            "SELECT child_product_id FROM components WHERE parent_product_id = ?",
+            (node,),
+        ):
+            stack.append(row["child_product_id"])
+    return False
+
+
 def add_component(
     conn: sqlite3.Connection,
     parent_product_id: int,
-    child_code: str,
+    child_product_id: int,
     quantity: float,
 ) -> int:
-    """Nest a code under a position and return its new row id.
+    """Nest a position under another and return the new row id.
 
-    ``child_code`` must be the code of an existing position (other than the
-    parent itself), since the nested code's name *and unit* are taken from that
-    position. Raises :class:`ValueError` if no position uses that code or if the
-    code refers to the parent position.
+    ``child_product_id`` is the id of the position to nest; its code, name and
+    unit are read live from that position (see :func:`list_components`). Raises
+    :class:`ValueError` if the child does not exist, is the parent itself, or
+    nesting it would create a cycle (e.g. A→B→A).
     """
-    child = find_product_by_code(conn, child_code)
-    if child is None:
-        raise ValueError(f"no position has code {child_code!r}")
-    if child["id"] == parent_product_id:
+    if get_product(conn, child_product_id) is None:
+        raise ValueError(f"no position with id {child_product_id!r}")
+    if child_product_id == parent_product_id:
         raise ValueError("a position cannot be nested inside itself")
+    if _reaches(conn, child_product_id, parent_product_id):
+        raise ValueError("nesting this position here would create a cycle")
     cur = conn.execute(
         """
-        INSERT INTO components (parent_product_id, child_code, quantity)
+        INSERT INTO components (parent_product_id, child_product_id, quantity)
         VALUES (?, ?, ?)
         """,
-        (parent_product_id, child_code, _round_qty(quantity)),
+        (parent_product_id, child_product_id, _round_qty(quantity)),
     )
     conn.commit()
     return cur.lastrowid
@@ -428,19 +488,20 @@ def add_component(
 def list_components(
     conn: sqlite3.Connection, parent_product_id: int
 ) -> list[sqlite3.Row]:
-    """Return the codes nested under one position, ordered by child code.
+    """Return the positions nested under one position, ordered by child code.
 
-    Each row includes ``child_name`` and ``unit`` looked up from the referenced
-    position (both ``None`` if that position has since been deleted), so editing
-    a position's unit is reflected by every nesting of it.
+    Each row carries the child's ``child_code``, ``child_name`` and ``unit``
+    looked up live from the referenced position, plus ``child_product_id``. So
+    editing a position's code or unit is reflected by every nesting of it.
     """
     return conn.execute(
         """
-        SELECT c.id, c.child_code, p.name AS child_name, c.quantity, p.unit AS unit
+        SELECT c.id, c.child_product_id, p.code AS child_code,
+               p.name AS child_name, c.quantity, p.unit AS unit
         FROM components c
-        LEFT JOIN products p ON p.code = c.child_code
+        JOIN products p ON p.id = c.child_product_id
         WHERE c.parent_product_id = ?
-        ORDER BY c.child_code
+        ORDER BY p.code
         """,
         (parent_product_id,),
     ).fetchall()
@@ -454,8 +515,8 @@ def update_component(
     """Update the quantity of an existing nested code.
 
     Only the quantity is per-nesting. The unit comes from the referenced
-    position (change it there), and the ``child_code`` reference is fixed: to
-    point a nested entry at a different position, delete it and add a new one.
+    position (change it there), and the referenced position is fixed: to point a
+    nested entry at a different position, delete it and add a new one.
     """
     conn.execute(
         "UPDATE components SET quantity = ? WHERE id = ?",
@@ -507,7 +568,7 @@ def effective_nutrition(
     total_grams = 0.0
     totals = {n: 0.0 for n in NUTRIENTS}
     for comp in components:
-        child = find_product_by_code(conn, comp["child_code"])
+        child = get_product(conn, comp["child_product_id"])
         if child is None:
             continue
         grams = float(comp["quantity"]) * float(child["weight_kg"]) * 1000.0

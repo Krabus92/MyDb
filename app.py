@@ -754,7 +754,7 @@ class NestedCodePicker(tk.Toplevel):
                 "Select a position", "Pick a position from the list.", parent=self
             )
             return
-        chosen = db.get_product(self.conn, int(selection[0]))
+        child_product_id = int(selection[0])
         try:
             quantity = float(self.qty.get() or 0)
         except ValueError:
@@ -764,7 +764,7 @@ class NestedCodePicker(tk.Toplevel):
             return
         try:
             db.add_component(
-                self.conn, self.parent_product_id, chosen["code"], quantity,
+                self.conn, self.parent_product_id, child_product_id, quantity,
             )
         except ValueError as exc:
             messagebox.showerror("Could not add nested code", str(exc), parent=self)

@@ -149,7 +149,7 @@ class DbLayerTests(unittest.TestCase):
         a = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
         b = db.add_product(self.conn, "B-200", "Butter", 1, "kg")  # 1 kg/unit
         db.update_nutrition(self.conn, b, 80, 50, 1, 0, 1, 1.5)
-        db.add_component(self.conn, a, "B-200", 2)  # 2 kg of butter
+        db.add_component(self.conn, a, b, 2)  # 2 kg of butter
 
         n = db.effective_nutrition(self.conn, a)
         self.assertAlmostEqual(n["fat"], 80)
@@ -163,8 +163,8 @@ class DbLayerTests(unittest.TestCase):
         c = db.add_product(self.conn, "C-300", "Lean", 1, "kg")
         db.update_nutrition(self.conn, b, 10, 0, 0, 0, 0, 0)   # fat 10/100g
         db.update_nutrition(self.conn, c, 0, 0, 0, 0, 30, 0)   # protein 30/100g
-        db.add_component(self.conn, a, "B-200", 1)  # 1 kg = 1000 g
-        db.add_component(self.conn, a, "C-300", 1)  # 1 kg = 1000 g
+        db.add_component(self.conn, a, b, 1)  # 1 kg = 1000 g
+        db.add_component(self.conn, a, c, 1)  # 1 kg = 1000 g
 
         n = db.effective_nutrition(self.conn, a)
         # 1000 g each: fat mass 100 over 2000 g -> 5/100g; protein 300 -> 15/100g.
@@ -176,7 +176,7 @@ class DbLayerTests(unittest.TestCase):
         # An egg: counted in pieces, 0.05 kg each, 11 g fat per 100 g.
         egg = db.add_product(self.conn, "E-1", "Egg", 1, "gab.", "", 0.05)
         db.update_nutrition(self.conn, egg, 11, 3, 1, 1, 13, 0.3)
-        db.add_component(self.conn, a, "E-1", 4)  # 4 eggs = 200 g, all of it
+        db.add_component(self.conn, a, egg, 4)  # 4 eggs = 200 g, all of it
 
         n = db.effective_nutrition(self.conn, a)
         self.assertAlmostEqual(n["fat"], 11)
@@ -186,9 +186,9 @@ class DbLayerTests(unittest.TestCase):
         base = db.add_product(self.conn, "C-300", "Oil", 1, "kg")
         db.update_nutrition(self.conn, base, 100, 14, 0, 0, 0, 0)  # pure fat
         mid = db.add_product(self.conn, "B-200", "Dressing", 1, "kg")
-        db.add_component(self.conn, mid, "C-300", 1)  # Dressing is 100% Oil
+        db.add_component(self.conn, mid, base, 1)  # Dressing is 100% Oil
         top = db.add_product(self.conn, "A-100", "Salad", 1, "kg")
-        db.add_component(self.conn, top, "B-200", 1)  # Salad is 100% Dressing
+        db.add_component(self.conn, top, mid, 1)  # Salad is 100% Dressing
 
         n = db.effective_nutrition(self.conn, top)
         self.assertAlmostEqual(n["fat"], 100)  # rolled up two levels
@@ -197,8 +197,15 @@ class DbLayerTests(unittest.TestCase):
         a = db.add_product(self.conn, "A-100", "A", 1, "kg")
         b = db.add_product(self.conn, "B-200", "B", 1, "kg")
         db.update_nutrition(self.conn, a, 7, 0, 0, 0, 0, 0)
-        db.add_component(self.conn, a, "B-200", 1)
-        db.add_component(self.conn, b, "A-100", 1)  # A -> B -> A cycle
+        db.add_component(self.conn, a, b, 1)
+        # add_component would reject the back-edge, so insert it directly to
+        # prove the roll-up still terminates if a cyclic row ever exists.
+        self.conn.execute(
+            "INSERT INTO components (parent_product_id, child_product_id, quantity)"
+            " VALUES (?, ?, ?)",
+            (b, a, 1),
+        )
+        self.conn.commit()
 
         n = db.effective_nutrition(self.conn, a)  # must terminate
         self.assertIsInstance(n["fat"], float)
@@ -301,22 +308,23 @@ class DbLayerTests(unittest.TestCase):
 
     def test_update_product_scales_nested_quantities(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        db.add_product(self.conn, "C-300", "Resin", 0, "kg")
-        db.add_component(self.conn, parent, "B-200", 1)
-        db.add_component(self.conn, parent, "C-300", 2.5)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        resin = db.add_product(self.conn, "C-300", "Resin", 0, "kg")
+        db.add_component(self.conn, parent, bolt, 1)
+        db.add_component(self.conn, parent, resin, 2.5)
 
         # Doubling the position's quantity (1 -> 2) doubles every nested code.
         db.update_product(self.conn, parent, "A-100", "Widget", 2, "gab.")
 
-        comps = {c["child_code"]: c["quantity"] for c in db.list_components(self.conn, parent)}
+        comps = {c["child_code"]: c["quantity"]
+                 for c in db.list_components(self.conn, parent)}
         self.assertEqual(comps["B-200"], 2)
         self.assertEqual(comps["C-300"], 5)
 
     def test_update_product_scales_down_and_rounds(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 3, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        db.add_component(self.conn, parent, "B-200", 1)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        db.add_component(self.conn, parent, bolt, 1)
 
         # 3 -> 1 is a factor of 1/3; 1 * 1/3 rounds to 0.33333.
         db.update_product(self.conn, parent, "A-100", "Widget", 1, "gab.")
@@ -324,8 +332,8 @@ class DbLayerTests(unittest.TestCase):
 
     def test_update_product_without_quantity_change_leaves_nested(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 2, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        db.add_component(self.conn, parent, "B-200", 5)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        db.add_component(self.conn, parent, bolt, 5)
 
         # Only the name changes; quantity stays 2, so nested codes are untouched.
         db.update_product(self.conn, parent, "A-100", "Renamed", 2, "gab.")
@@ -333,8 +341,8 @@ class DbLayerTests(unittest.TestCase):
 
     def test_update_product_from_zero_quantity_skips_scaling(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 0, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        db.add_component(self.conn, parent, "B-200", 5)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        db.add_component(self.conn, parent, bolt, 5)
 
         # No baseline to scale from (0 -> 4), so nested codes are left as-is.
         db.update_product(self.conn, parent, "A-100", "Widget", 4, "gab.")
@@ -344,8 +352,8 @@ class DbLayerTests(unittest.TestCase):
         pid = db.add_product(self.conn, "A-100", "Widget", 1.234567, "gab.")
         self.assertEqual(db.get_product(self.conn, pid)["quantity"], 1.23457)
 
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        comp_id = db.add_component(self.conn, pid, "B-200", 0.123456)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        comp_id = db.add_component(self.conn, pid, bolt, 0.123456)
         self.assertEqual(db.list_components(self.conn, pid)[0]["quantity"], 0.12346)
 
         db.update_component(self.conn, comp_id, 9.876543)
@@ -363,8 +371,8 @@ class DbLayerTests(unittest.TestCase):
 
     def test_delete_product_cascades_to_components(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 1, "gab.")
-        db.add_component(self.conn, parent, "B-200", 5)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 1, "gab.")
+        db.add_component(self.conn, parent, bolt, 5)
 
         db.delete_product(self.conn, parent)
         self.assertIsNone(db.get_product(self.conn, parent))
@@ -374,10 +382,10 @@ class DbLayerTests(unittest.TestCase):
 
     def test_add_and_list_components_with_resolved_name_and_unit(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        db.add_product(self.conn, "C-300", "Resin", 0, "kg")
-        db.add_component(self.conn, parent, "B-200", 5)
-        db.add_component(self.conn, parent, "C-300", 2.3)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        resin = db.add_product(self.conn, "C-300", "Resin", 0, "kg")
+        db.add_component(self.conn, parent, bolt, 5)
+        db.add_component(self.conn, parent, resin, 2.3)
 
         components = db.list_components(self.conn, parent)
         self.assertEqual(len(components), 2)
@@ -393,17 +401,18 @@ class DbLayerTests(unittest.TestCase):
         # changing it on the position updates every nesting of that position.
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "kg")
-        db.add_component(self.conn, parent, "B-200", 5)
+        db.add_component(self.conn, parent, bolt, 5)
         self.assertEqual(db.list_components(self.conn, parent)[0]["unit"], "kg")
 
         db.update_product(self.conn, bolt, "B-200", "Bolt", 0, "gab.")
         self.assertEqual(db.list_components(self.conn, parent)[0]["unit"], "gab.")
 
-    def test_renaming_code_repoints_nested_references(self) -> None:
-        # Renaming a position's code must not orphan recipes that nest it.
+    def test_renaming_code_is_reflected_in_nested_references(self) -> None:
+        # References are by id, so renaming a position's code is followed
+        # automatically and never orphans the recipes that nest it.
         parent = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
         bolt = db.add_product(self.conn, "B-200", "Bolt", 1, "kg")
-        db.add_component(self.conn, parent, "B-200", 5)
+        db.add_component(self.conn, parent, bolt, 5)
 
         db.update_product(self.conn, bolt, "B-999", "Bolt", 1, "kg")
 
@@ -415,17 +424,35 @@ class DbLayerTests(unittest.TestCase):
     def test_nested_code_must_reference_existing_position(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         with self.assertRaises(ValueError):
-            db.add_component(self.conn, parent, "DOES-NOT-EXIST", 1)
+            db.add_component(self.conn, parent, 9999, 1)  # no such product id
 
     def test_position_cannot_nest_itself(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
         with self.assertRaises(ValueError):
-            db.add_component(self.conn, parent, "A-100", 1)
+            db.add_component(self.conn, parent, parent, 1)
+
+    def test_add_component_rejects_indirect_cycle(self) -> None:
+        a = db.add_product(self.conn, "A-100", "A", 1, "kg")
+        b = db.add_product(self.conn, "B-200", "B", 1, "kg")
+        db.add_component(self.conn, a, b, 1)            # A contains B
+        with self.assertRaises(ValueError):
+            db.add_component(self.conn, b, a, 1)        # B contains A -> cycle
+
+    def test_deleting_child_removes_nested_lines(self) -> None:
+        # Referencing by id means deleting an ingredient removes the nested
+        # lines that used it (no more orphaned "(unknown)" rows).
+        recipe = db.add_product(self.conn, "A-100", "Recipe", 1, "kg")
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 1, "kg")
+        db.add_component(self.conn, recipe, bolt, 5)
+        self.assertEqual(len(db.list_components(self.conn, recipe)), 1)
+
+        db.delete_product(self.conn, bolt)
+        self.assertEqual(db.list_components(self.conn, recipe), [])
 
     def test_update_component_changes_only_quantity(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "kg")
-        comp_id = db.add_component(self.conn, parent, "B-200", 5)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "kg")
+        comp_id = db.add_component(self.conn, parent, bolt, 5)
 
         db.update_component(self.conn, comp_id, 12)
 
@@ -436,8 +463,8 @@ class DbLayerTests(unittest.TestCase):
 
     def test_delete_component(self) -> None:
         parent = db.add_product(self.conn, "A-100", "Widget", 1, "gab.")
-        db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
-        comp_id = db.add_component(self.conn, parent, "B-200", 5)
+        bolt = db.add_product(self.conn, "B-200", "Bolt", 0, "gab.")
+        comp_id = db.add_component(self.conn, parent, bolt, 5)
 
         db.delete_component(self.conn, comp_id)
         self.assertEqual(db.list_components(self.conn, parent), [])
@@ -445,14 +472,57 @@ class DbLayerTests(unittest.TestCase):
     def test_components_isolated_per_product(self) -> None:
         first = db.add_product(self.conn, "A-100", "First", 1, "gab.")
         second = db.add_product(self.conn, "B-200", "Second", 1, "gab.")
-        db.add_product(self.conn, "C-300", "Child", 0, "gab.")
-        db.add_component(self.conn, first, "C-300", 1)
+        child = db.add_product(self.conn, "C-300", "Child", 0, "gab.")
+        db.add_component(self.conn, first, child, 1)
 
         self.assertEqual(len(db.list_components(self.conn, first)), 1)
         self.assertEqual(len(db.list_components(self.conn, second)), 0)
 
+    # ----- migrations of the components table ---------------------------
+
+    def test_init_db_migrates_child_code_to_product_id(self) -> None:
+        # A database that still references nested codes by their code string,
+        # including one row whose code matches no position (already orphaned).
+        conn = db.get_connection(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                unit TEXT NOT NULL CHECK (unit IN ('gab.', 'kg'))
+            );
+            CREATE TABLE components (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_product_id INTEGER NOT NULL,
+                child_code TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY (parent_product_id)
+                    REFERENCES products (id) ON DELETE CASCADE
+            );
+            INSERT INTO products (code, name, quantity, unit)
+                VALUES ('A-100', 'Recipe', 1, 'kg'), ('B-200', 'Bolt', 1, 'kg');
+            INSERT INTO components (parent_product_id, child_code, quantity)
+                VALUES (1, 'B-200', 5), (1, 'GONE', 9);
+            """
+        )
+        conn.commit()
+
+        db.init_db(conn)
+
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(components)")]
+        self.assertIn("child_product_id", columns)
+        self.assertNotIn("child_code", columns)
+
+        comps = db.list_components(conn, 1)
+        self.assertEqual(len(comps), 1)  # the orphaned 'GONE' row was dropped
+        self.assertEqual(comps[0]["child_code"], "B-200")  # resolved by id
+        self.assertEqual(comps[0]["quantity"], 5)
+        conn.close()
+
     def test_init_db_migrates_away_old_component_unit_column(self) -> None:
-        # Simulate a pre-migration database that still stores a unit per code.
+        # A pre-migration database that stored both a per-code unit and the
+        # legacy child_code reference; both legacy columns should be gone.
         conn = db.get_connection(":memory:")
         conn.executescript(
             """
@@ -472,22 +542,23 @@ class DbLayerTests(unittest.TestCase):
                     REFERENCES products (id) ON DELETE CASCADE
             );
             INSERT INTO products (code, name, quantity, unit)
-                VALUES ('A-100', 'Widget', 1, 'gab.');
+                VALUES ('A-100', 'Widget', 1, 'gab.'), ('B-200', 'Bolt', 1, 'kg');
             INSERT INTO components (parent_product_id, child_code, quantity, unit)
                 VALUES (1, 'B-200', 5, 'kg');
             """
         )
         conn.commit()
 
-        db.init_db(conn)  # should drop components.unit but keep the data
+        db.init_db(conn)  # drops components.unit AND migrates to child_product_id
 
         columns = [r["name"] for r in conn.execute("PRAGMA table_info(components)")]
         self.assertNotIn("unit", columns)
-        row = conn.execute(
-            "SELECT child_code, quantity FROM components"
-        ).fetchone()
-        self.assertEqual(row["child_code"], "B-200")
-        self.assertEqual(row["quantity"], 5)
+        self.assertNotIn("child_code", columns)
+        self.assertIn("child_product_id", columns)
+
+        comp = db.list_components(conn, 1)[0]
+        self.assertEqual(comp["child_code"], "B-200")  # resolved from id
+        self.assertEqual(comp["quantity"], 5)
         conn.close()
 
 
